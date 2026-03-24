@@ -12,7 +12,6 @@ tbt_app.py      ← you are here  (UI routing & session state)
 tbt_engine.py   ← parsing, scoring, analytics pipeline
 tbt_charts.py   ← Plotly chart factories
 tbt_ui.py       ← reusable HTML/CSS component renderers
-tbt_demo.py     ← sample dataset generators
 tbt_export.py   ← Excel / ZIP export helpers
 requirements.txt
 """
@@ -38,7 +37,6 @@ from tbt_charts import (
     chart_speaker_phase_heatmap,
     chart_tbt_flow,
 )
-from tbt_demo import DEMO_REGISTRY, make_demo_df
 from tbt_engine import FORMAT_LABELS, run_pipeline
 from tbt_export import to_excel, to_zip
 from tbt_ui import (
@@ -82,12 +80,11 @@ def _ss_set(key: str, value) -> None:
 # Sidebar
 # ============================================================================
 
-def render_sidebar() -> tuple[str, Optional[object], Optional[str]]:
+def render_sidebar() -> tuple[str, Optional[object]]:
     """
-    Render the sidebar and return (dataset_type, uploaded_file, demo_label).
+    Render the sidebar and return (dataset_type, uploaded_file).
 
-    ``demo_label`` is None unless the user clicked ▶ Run Demo with a demo
-    selected.  ``uploaded_file`` is None if no file was uploaded.
+    ``uploaded_file`` is None if no file has been uploaded yet.
     """
     with st.sidebar:
         st.markdown(
@@ -124,20 +121,6 @@ def render_sidebar() -> tuple[str, Optional[object], Optional[str]]:
             help="Upload a file containing conversation transcripts or customer feedback.",
         )
 
-        # ---- Demo mode ----
-        st.markdown("---")
-        st.markdown("### 🎯 Demo Mode")
-        demo_options = ["— Select demo —"] + list(DEMO_REGISTRY.keys())
-        demo_sel = st.selectbox(
-            "Run with sample data",
-            options=demo_options,
-        )
-        run_demo_btn = st.button("▶ Run Demo", use_container_width=True, type="secondary")
-
-        demo_label: Optional[str] = (
-            demo_sel if (run_demo_btn and demo_sel != "— Select demo —") else None
-        )
-
         st.markdown("---")
         st.markdown(
             '<div style="color:#555;font-size:.72rem;text-align:center">'
@@ -146,7 +129,7 @@ def render_sidebar() -> tuple[str, Optional[object], Optional[str]]:
             unsafe_allow_html=True,
         )
 
-    return dataset_type, uploaded, demo_label
+    return dataset_type, uploaded
 
 
 # ============================================================================
@@ -155,14 +138,13 @@ def render_sidebar() -> tuple[str, Optional[object], Optional[str]]:
 
 def load_data(
     uploaded,
-    demo_label: Optional[str],
     dataset_type: str,
 ) -> tuple[Optional[pd.DataFrame], str, str]:
     """
-    Resolve the active data source and return (df_raw, source_label, dataset_type).
+    Load data from the uploaded file.
 
-    Priority: uploaded file > demo selection.
-    Returns (None, "", dataset_type) if no source is active.
+    Returns (df_raw, source_label, dataset_type), or
+    (None, "", dataset_type) if no file has been uploaded.
     """
     if uploaded is not None:
         try:
@@ -175,10 +157,6 @@ def load_data(
         except Exception as exc:
             st.error(f"Could not read file: {exc}")
             return None, "", dataset_type
-
-    if demo_label:
-        df_raw, dtype = make_demo_df(demo_label)
-        return df_raw, f"🎭 Demo — {demo_label}", dtype
 
     return None, "", dataset_type
 
@@ -378,17 +356,17 @@ def main() -> None:
     Flow
     ----
     1. Render header + sidebar → collect user inputs.
-    2. Load data (file upload or demo).
+    2. Load data from uploaded file.
     3. If no data → show landing / welcome screen.
     4. Run the analysis pipeline (cached by data fingerprint).
     5. Render status bar + KPI row.
     6. Render five tabs: Overview / Flow / Explorer / Data / Recommendations.
     """
     render_header()
-    dataset_type, uploaded, demo_label = render_sidebar()
+    dataset_type, uploaded = render_sidebar()
 
     # -- Resolve data source --------------------------------------------------
-    df_raw, source_label, dataset_type = load_data(uploaded, demo_label, dataset_type)
+    df_raw, source_label, dataset_type = load_data(uploaded, dataset_type)
 
     if df_raw is None:
         render_landing()

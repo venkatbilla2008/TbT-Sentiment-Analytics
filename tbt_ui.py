@@ -354,7 +354,7 @@ transcripts and customer feedback across six domain formats.
 
 **Getting started:**
 1. Select your domain in the sidebar
-2. Upload a CSV / Excel file — or pick a **Demo** and click ▶ Run Demo
+2. Upload a CSV / Excel file to begin analysis
 """
         )
     with col_r:
