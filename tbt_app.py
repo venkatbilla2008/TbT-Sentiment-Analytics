@@ -221,18 +221,18 @@ def _tab_overview(df_results: pd.DataFrame, insights: dict) -> None:
     st.markdown("#### 📈 Visual Overview")
     c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(chart_sentiment_dist(df_results),  use_container_width=True)
+        st.plotly_chart(chart_sentiment_dist(df_results),  width='stretch')
     with c2:
-        st.plotly_chart(chart_speaker_box(df_results),     use_container_width=True)
+        st.plotly_chart(chart_speaker_box(df_results),     width='stretch')
 
     c3, c4 = st.columns(2)
     with c3:
-        st.plotly_chart(chart_phase_comparison(insights),       use_container_width=True)
+        st.plotly_chart(chart_phase_comparison(insights),       width='stretch')
     with c4:
-        st.plotly_chart(chart_escalation_resolution(df_results), use_container_width=True)
+        st.plotly_chart(chart_escalation_resolution(df_results), width='stretch')
 
-    st.plotly_chart(chart_sentiment_progression(df_results), use_container_width=True)
-    st.plotly_chart(chart_conversation_heatmap(df_results),  use_container_width=True)
+    st.plotly_chart(chart_sentiment_progression(df_results), width='stretch')
+    st.plotly_chart(chart_conversation_heatmap(df_results),  width='stretch')
 
 
 def _tab_tbt_flow(df_results: pd.DataFrame) -> None:
@@ -256,13 +256,13 @@ def _tab_tbt_flow(df_results: pd.DataFrame) -> None:
         df_view = df_view[df_view["phase"] == phase_flt]
 
     # Flow chart (always shows full conversation, unfiltered)
-    st.plotly_chart(chart_tbt_flow(df_results, sel_conv), use_container_width=True)
+    st.plotly_chart(chart_tbt_flow(df_results, sel_conv), width='stretch')
 
     # Momentum chart
-    st.plotly_chart(chart_sentiment_momentum(df_results, sel_conv), use_container_width=True)
+    st.plotly_chart(chart_sentiment_momentum(df_results, sel_conv), width='stretch')
 
     # Speaker × phase heatmap
-    st.plotly_chart(chart_speaker_phase_heatmap(df_results, sel_conv), use_container_width=True)
+    st.plotly_chart(chart_speaker_phase_heatmap(df_results, sel_conv), width='stretch')
 
     # Mini metrics for selected conversation / filter
     cu_sub = df_view[df_view["speaker"] == "CUSTOMER"]
@@ -321,7 +321,7 @@ def _tab_data_table(df_results: pd.DataFrame) -> None:
     st.markdown(f"**{len(df_tbl):,} rows** after filters")
     st.dataframe(
         df_tbl[display_cols].reset_index(drop=True),
-        use_container_width=True,
+        width='stretch',
         height=450,
     )
 
@@ -355,7 +355,7 @@ def _tab_recommendations(df_results: pd.DataFrame, insights: dict) -> None:
             data=to_excel(df_results, insights),
             file_name=f"tbt_results_{ts}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
+            width='stretch',
         )
     with col_dl2:
         st.download_button(
@@ -363,7 +363,7 @@ def _tab_recommendations(df_results: pd.DataFrame, insights: dict) -> None:
             data=to_zip(df_results, insights),
             file_name=f"tbt_complete_{ts}.zip",
             mime="application/zip",
-            use_container_width=True,
+            width='stretch',
         )
 
 
@@ -416,7 +416,7 @@ def main() -> None:
             data=to_zip(df_results, insights),
             file_name=f"tbt_analysis_{ts}.zip",
             mime="application/zip",
-            use_container_width=True,
+            width='stretch',
         )
 
     st.markdown("---")
