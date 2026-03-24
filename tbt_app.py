@@ -2,28 +2,16 @@
 tbt_app.py
 ==========
 Domain Agnostic — Turn-by-Turn Sentiment Analytics (Streamlit)
-
-Single-file app — all logic is self-contained here.
+Single-file app — all logic self-contained here.
 
 Run with:
     streamlit run tbt_app.py
 
-Sections (in order)
--------------------
-1.  Imports & page config
-2.  Global CSS
-3.  Constants & colour helpers
-4.  Numba-accelerated math helpers
-5.  ConversationProcessor  — transcript / feedback parser
-6.  SentimentEngine        — VADER scorer with adaptive thresholds
-7.  AnalyticsEngine        — turn metrics + business insights
-8.  run_pipeline()         — chains 5-7
-9.  Export helpers         — Excel / ZIP builders
-10. Chart factories        — Plotly figures
-11. UI component renderers — HTML/CSS helpers
-12. Sidebar
-13. Tab renderers
-14. main()
+Fixes in this version
+---------------------
+- Removed numba dependency (caused Streamlit Cloud health-check crash)
+- Fixed sidebar text/label visibility on dark background
+- Improved export section with clearly visible download buttons
 """
 
 from __future__ import annotations
@@ -46,7 +34,6 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from numba import njit
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 warnings.filterwarnings("ignore")
@@ -72,6 +59,7 @@ st.markdown("""
 
 html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
+/* ---- App header ---- */
 .app-header {
     background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
     border-radius: 16px; padding: 2.4rem 2rem 1.8rem;
@@ -81,6 +69,7 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 .app-header h1 { color:#fff; font-size:2.1rem; font-weight:700; margin:0 0 .4rem; letter-spacing:-.5px; }
 .app-header p  { color:#bbb; font-size:1rem; margin:0; }
 
+/* ---- Metric cards ---- */
 .metric-grid { display:flex; gap:1rem; flex-wrap:wrap; margin-bottom:1.4rem; }
 .metric-card {
     flex:1; min-width:130px;
@@ -89,40 +78,89 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
     border:1px solid rgba(255,255,255,0.08);
     box-shadow:0 4px 20px rgba(0,0,0,0.25); text-align:center;
 }
-.metric-card .m-label { color:#888; font-size:.75rem; text-transform:uppercase; letter-spacing:1px; margin-bottom:.3rem; }
+.metric-card .m-label { color:#aaa; font-size:.75rem; text-transform:uppercase; letter-spacing:1px; margin-bottom:.3rem; }
 .metric-card .m-value { color:#fff; font-size:1.9rem; font-weight:700; line-height:1.1; }
 .metric-card .m-sub   { color:#aaa; font-size:.8rem; margin-top:.25rem; }
 
+/* ---- Phase table ---- */
 .phase-table { width:100%; border-collapse:collapse; font-size:.88rem; }
-.phase-table th { background:#1e1e3f; color:#ccc; padding:.6rem .9rem; text-align:left; font-weight:600; }
+.phase-table th { background:#1e1e3f; color:#ddd; padding:.6rem .9rem; text-align:left; font-weight:600; }
 .phase-table td { padding:.55rem .9rem; border-bottom:1px solid rgba(255,255,255,0.05); color:#eee; }
 .phase-table tr:hover td { background:rgba(255,255,255,0.03); }
 
+/* ---- Sentiment badges ---- */
 .badge-csat    { background:#1a6640; color:#7fff9e; padding:2px 8px; border-radius:999px; font-size:.75rem; font-weight:600; }
 .badge-dsat    { background:#6b1a1a; color:#ff9e9e; padding:2px 8px; border-radius:999px; font-size:.75rem; font-weight:600; }
 .badge-neutral { background:#3a3a5c; color:#c7c7ff; padding:2px 8px; border-radius:999px; font-size:.75rem; font-weight:600; }
 
+/* ---- Turn viewer cards ---- */
 .turn-card { border-radius:10px; padding:.8rem 1rem; margin-bottom:.5rem; border-left:4px solid transparent; }
 .turn-customer { background:rgba(255,107,107,0.08); border-color:#ff6b6b; }
 .turn-agent    { background:rgba(78,205,196,0.08);  border-color:#4ecdc4; }
-.turn-header   { font-size:.75rem; color:#888; margin-bottom:.2rem; }
+.turn-header   { font-size:.75rem; color:#aaa; margin-bottom:.2rem; }
 .turn-text     { font-size:.93rem; color:#eee; }
-.turn-meta     { font-size:.72rem; color:#666; margin-top:.3rem; }
+.turn-meta     { font-size:.72rem; color:#999; margin-top:.3rem; }
 
+/* ---- Recommendation cards ---- */
 .rec-card {
-    background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08);
+    background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.1);
     border-radius:10px; padding:.75rem 1rem; margin-bottom:.5rem;
     font-size:.88rem; color:#ddd;
 }
 
+/* ---- Score bar ---- */
 .score-bar-wrap  { display:flex; align-items:center; gap:.5rem; }
-.score-bar-track { flex:1; height:6px; background:#333; border-radius:999px; overflow:hidden; }
+.score-bar-track { flex:1; height:6px; background:#444; border-radius:999px; overflow:hidden; }
 .score-bar-fill  { height:100%; border-radius:999px; transition:width .4s; }
 
-section[data-testid="stSidebar"] { background: linear-gradient(180deg,#0d0d1a 0%,#12122b 100%); }
-section[data-testid="stSidebar"] .stSelectbox label,
-section[data-testid="stSidebar"] .stFileUploader label { color:#ccc !important; }
+/* ---- Export button cards ---- */
+.export-card {
+    background: linear-gradient(135deg,#1a1a2e,#16213e);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 12px; padding: 1.2rem 1.4rem; margin-bottom: .75rem;
+}
+.export-card .ex-title { color:#fff; font-size:.95rem; font-weight:600; margin-bottom:.25rem; }
+.export-card .ex-desc  { color:#aaa; font-size:.8rem; margin-bottom:.75rem; }
 
+/* ---- SIDEBAR — force all text to be visible on dark bg ---- */
+section[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #0d0d1a 0%, #12122b 100%);
+}
+section[data-testid="stSidebar"] * {
+    color: #e0e0e0 !important;
+}
+section[data-testid="stSidebar"] h1,
+section[data-testid="stSidebar"] h2,
+section[data-testid="stSidebar"] h3 {
+    color: #ffffff !important;
+}
+section[data-testid="stSidebar"] .stSelectbox > label,
+section[data-testid="stSidebar"] .stFileUploader > label {
+    color: #e0e0e0 !important;
+    font-weight: 500 !important;
+}
+section[data-testid="stSidebar"] .stSelectbox [data-baseweb="select"] > div,
+section[data-testid="stSidebar"] .stFileUploader [data-testid="stFileUploaderDropzone"] {
+    background: rgba(255,255,255,0.07) !important;
+    border-color: rgba(255,255,255,0.2) !important;
+    color: #fff !important;
+}
+section[data-testid="stSidebar"] small,
+section[data-testid="stSidebar"] p {
+    color: #ccc !important;
+}
+/* Uploaded file name visibility */
+section[data-testid="stSidebar"] [data-testid="stFileUploaderFile"] {
+    color: #fff !important;
+    background: rgba(255,255,255,0.08) !important;
+    border-radius: 6px;
+}
+section[data-testid="stSidebar"] [data-testid="stFileUploaderFileName"] {
+    color: #fff !important;
+    font-weight: 600 !important;
+}
+
+/* ---- Tabs ---- */
 .stTabs [data-baseweb="tab-list"] { gap:6px; }
 .stTabs [data-baseweb="tab"] {
     background:rgba(255,255,255,0.04); border-radius:8px 8px 0 0;
@@ -179,23 +217,25 @@ def _fmt_pct(v: float) -> str: return f"{v:.1%}"
 
 
 # ===========================================================================
-# 4. Numba-accelerated math helpers
+# 4. Pure-numpy math helpers  (replaces numba — no JIT compile delay)
 # ===========================================================================
 
-@njit
 def _fast_rolling_mean_3(arr: np.ndarray) -> np.ndarray:
-    n = len(arr); result = np.empty(n, dtype=np.float64)
-    for i in range(n):
-        if i == 0:   result[i] = arr[i]
-        elif i == 1: result[i] = (arr[i-1] + arr[i]) / 2.0
-        else:        result[i] = (arr[i-2] + arr[i-1] + arr[i]) / 3.0
+    """Causal 3-point rolling mean using pure numpy — no compilation needed."""
+    result = np.empty(len(arr), dtype=np.float64)
+    result[0] = arr[0]
+    if len(arr) > 1:
+        result[1] = (arr[0] + arr[1]) / 2.0
+    for i in range(2, len(arr)):
+        result[i] = (arr[i-2] + arr[i-1] + arr[i]) / 3.0
     return result
 
-@njit
+
 def _fast_sentiment_change(arr: np.ndarray) -> np.ndarray:
-    n = len(arr); result = np.empty(n, dtype=np.float64)
+    """First-difference — index 0 is always 0."""
+    result    = np.empty(len(arr), dtype=np.float64)
     result[0] = 0.0
-    for i in range(1, n): result[i] = arr[i] - arr[i-1]
+    result[1:] = arr[1:] - arr[:-1]
     return result
 
 
@@ -246,7 +286,7 @@ class ConversationProcessor:
             rows.extend(self._dispatch(text, int(idx)))
 
         if not rows and self.dataset_type != "auto":
-            sample  = str(df[col].dropna().iloc[0]) if len(df) > 0 else ""
+            sample   = str(df[col].dropna().iloc[0]) if len(df) > 0 else ""
             detected = self._detect(sample, col)
             if detected != self.dataset_type:
                 self.dataset_type = detected
@@ -276,10 +316,10 @@ class ConversationProcessor:
         return "hilton" if ("additional" in cl or "hilton" in cl) else "lyft"
 
     def _dispatch(self, text: str, idx: int) -> List[Dict]:
-        if self.dataset_type == "netflix":          return self._parse_netflix(text, idx)
-        if self.dataset_type == "humana":           return self._parse_humana(text, idx)
-        if self.dataset_type == "ppt":              return self._parse_ppt(text, idx)
-        if self.dataset_type in ("lyft","hilton"):  return self._parse_feedback(text, idx)
+        if self.dataset_type == "netflix":         return self._parse_netflix(text, idx)
+        if self.dataset_type == "humana":          return self._parse_humana(text, idx)
+        if self.dataset_type == "ppt":             return self._parse_ppt(text, idx)
+        if self.dataset_type in ("lyft","hilton"): return self._parse_feedback(text, idx)
         return self._parse_spotify(text, idx)
 
     def _find_col(self, df: pd.DataFrame) -> Optional[str]:
@@ -347,7 +387,7 @@ class ConversationProcessor:
             if sl in {"system","automated","ivr","automated system"}: continue
             m = msg.strip()
             if not m or len(m) < 3: continue
-            if any(k in sl for k in ["member","customer","patient","caller"]):       ns = "CUSTOMER"
+            if any(k in sl for k in ["member","customer","patient","caller"]):             ns = "CUSTOMER"
             elif any(k in sl for k in ["agent","representative","rep","advisor","specialist"]): ns = "AGENT"
             else: ns = spk.strip().upper()
             turns.append(self._row(idx, tn, ts, ns, m)); tn += 1
@@ -463,7 +503,7 @@ class AnalyticsEngine:
         d.loc[d["is_conversation_end"],  "phase"] = "end"
         d["is_csat"] = d["compound"] >= 0; d["is_dsat"] = d["compound"] < 0
         prev = d.groupby("conversation_id")["speaker"].shift(1)
-        d["prev_speaker"]    = prev; d["speaker_changed"] = d["speaker"] != prev
+        d["prev_speaker"]      = prev; d["speaker_changed"] = d["speaker"] != prev
         d["consecutive_turns"] = (d.groupby(["conversation_id",(d["speaker"]!=prev).cumsum()]).cumcount()+1)
         d["potential_escalation"] = ((d["sentiment_change"]<-0.3)&(d["speaker"]=="CUSTOMER")&(d["turn_sequence"]>2))
         d["potential_resolution"] = ((d["sentiment_change"]>0.2) &(d["speaker"]=="CUSTOMER")&(d["is_conversation_end"]))
@@ -484,10 +524,10 @@ class AnalyticsEngine:
             return default if np.isnan(v) else v
 
         ins["customer_satisfaction"] = {
-            "average_sentiment":     _safe(cu["compound"].mean())                        if not cu.empty else 0.0,
-            "positive_interactions": _safe((cu["sentiment_label"]=="positive").mean())   if not cu.empty else 0.0,
-            "escalation_rate":       _safe(cu["potential_escalation"].mean())             if not cu.empty else 0.0,
-            "resolution_rate":       _safe(cu["potential_resolution"].mean())             if not cu.empty else 0.0,
+            "average_sentiment":     _safe(cu["compound"].mean())                       if not cu.empty else 0.0,
+            "positive_interactions": _safe((cu["sentiment_label"]=="positive").mean())  if not cu.empty else 0.0,
+            "escalation_rate":       _safe(cu["potential_escalation"].mean())            if not cu.empty else 0.0,
+            "resolution_rate":       _safe(cu["potential_resolution"].mean())            if not cu.empty else 0.0,
         }
         ins["agent_performance"] = {
             "average_sentiment":      _safe(ag["compound"].mean())        if not ag.empty else 0.0,
@@ -521,19 +561,19 @@ class AnalyticsEngine:
 
     def _recommendations(self, ins: Dict) -> List[str]:
         r: List[str] = []
-        cs  = ins["customer_satisfaction"]; ap = ins["agent_performance"]
-        cp  = ins["conversation_patterns"]; pcd = ins.get("phase_csat_dsat",{})
-        if cs["average_sentiment"]  < 0:     r.append("🔴 Customer sentiment is below neutral — review agent training and script quality.")
-        if cs["escalation_rate"]    > 0.15:  r.append(f"⚠️ High escalation rate ({cs['escalation_rate']:.1%}) — analyse triggers and train de-escalation.")
-        elif cs["escalation_rate"]  > 0.10:  r.append(f"⚠️ Moderate escalation rate ({cs['escalation_rate']:.1%}) — monitor closely.")
-        if cs["resolution_rate"]    < 0.5:   r.append(f"🔴 Low resolution rate ({cs['resolution_rate']:.1%}) — strengthen closing techniques.")
-        if ap["average_sentiment"]  < 0.1:   r.append("📚 Agent sentiment is low — consider tone coaching and positive-language training.")
-        if cp["sentiment_improvement"] < 0:  r.append("📉 Conversations end worse than they start — review resolution processes.")
+        cs=ins["customer_satisfaction"]; ap=ins["agent_performance"]
+        cp=ins["conversation_patterns"]; pcd=ins.get("phase_csat_dsat",{})
+        if cs["average_sentiment"]      < 0:    r.append("🔴 Customer sentiment is below neutral — review agent training and script quality.")
+        if cs["escalation_rate"]        > 0.15: r.append(f"⚠️ High escalation rate ({cs['escalation_rate']:.1%}) — analyse triggers and train de-escalation.")
+        elif cs["escalation_rate"]      > 0.10: r.append(f"⚠️ Moderate escalation rate ({cs['escalation_rate']:.1%}) — monitor closely.")
+        if cs["resolution_rate"]        < 0.5:  r.append(f"🔴 Low resolution rate ({cs['resolution_rate']:.1%}) — strengthen closing techniques.")
+        if ap["average_sentiment"]      < 0.1:  r.append("📚 Agent sentiment is low — consider tone coaching and positive-language training.")
+        if cp["sentiment_improvement"]  < 0:    r.append("📉 Conversations end worse than they start — review resolution processes.")
         elif cp["sentiment_improvement"] > 0.2: r.append("📈 Strong positive sentiment improvement — document and replicate best-practice behaviours.")
         if pcd:
-            mid = pcd.get("middle",{}); end = pcd.get("end",{}); start = pcd.get("start",{})
-            if mid.get("dsat_pct",0) > 0.5:  r.append(f"⚠️ Mid-conversation DSAT at {mid['dsat_pct']:.1%} — reduce handle time.")
-            if end.get("dsat_pct",0) > 0.4:  r.append(f"🔴 End-conversation DSAT at {end['dsat_pct']:.1%} — improve wrap-up and follow-through.")
+            mid=pcd.get("middle",{}); end=pcd.get("end",{}); start=pcd.get("start",{})
+            if mid.get("dsat_pct",0)>0.5:  r.append(f"⚠️ Mid-conversation DSAT at {mid['dsat_pct']:.1%} — reduce handle time.")
+            if end.get("dsat_pct",0)>0.4:  r.append(f"🔴 End-conversation DSAT at {end['dsat_pct']:.1%} — improve wrap-up and follow-through.")
             if start.get("csat_pct",0)>0.7 and end.get("dsat_pct",0)>0.3:
                 r.append("📉 CRITICAL: Customers start satisfied but end dissatisfied — review resolution process.")
         if not r: r.append("✅ All key metrics are within healthy ranges — maintain current practices.")
@@ -588,13 +628,16 @@ def _to_excel(df: pd.DataFrame, insights: Dict[str, Any]) -> bytes:
     return buf.getvalue()
 
 
+def _to_csv(df: pd.DataFrame) -> str:
+    buf = io.StringIO(); df.to_csv(buf, index=False); return buf.getvalue()
+
+
 def _to_zip(df: pd.DataFrame, insights: Dict[str, Any]) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf,"w",compression=zipfile.ZIP_DEFLATED) as zf:
-        csv_buf = io.StringIO(); df.to_csv(csv_buf, index=False)
-        zf.writestr("tbt_results.csv", csv_buf.getvalue())
-        zf.writestr("tbt_insights.json", json.dumps(insights, indent=2, default=str))
-        zf.writestr("tbt_results.xlsx", _to_excel(df, insights))
+        zf.writestr("tbt_results.csv",     _to_csv(df))
+        zf.writestr("tbt_insights.json",   json.dumps(insights, indent=2, default=str))
+        zf.writestr("tbt_results.xlsx",    _to_excel(df, insights))
     return buf.getvalue()
 
 
@@ -619,46 +662,46 @@ def _chart_speaker_box(df: pd.DataFrame) -> go.Figure:
     fig.update_layout(**CHART_THEME, title="Customer vs Agent Sentiment", title_font_size=14); return fig
 
 def _chart_phase_comparison(insights: Dict) -> go.Figure:
-    pcd = insights.get("phase_csat_dsat",{}); phases=["Start","Middle","End"]
+    pcd=insights.get("phase_csat_dsat",{}); phases=["Start","Middle","End"]
     fig = go.Figure(data=[
         go.Bar(name="CSAT %", x=phases, y=[pcd.get(p.lower(),{}).get("csat_pct",0)*100 for p in phases], marker_color="#2ecc71"),
         go.Bar(name="DSAT %", x=phases, y=[pcd.get(p.lower(),{}).get("dsat_pct",0)*100 for p in phases], marker_color="#e74c3c"),
     ])
     fig.update_layout(**CHART_THEME, barmode="group", title="CSAT vs DSAT by Phase", title_font_size=14,
-                      yaxis=dict(title="% Customer Turns", gridcolor="rgba(255,255,255,0.05)"),
+                      yaxis=dict(title="% Customer Turns",gridcolor="rgba(255,255,255,0.05)"),
                       legend=dict(orientation="h",yanchor="bottom",y=1.02)); return fig
 
 def _chart_sentiment_progression(df: pd.DataFrame) -> go.Figure:
-    tp = df.groupby("turn_sequence")["compound"].mean().reset_index(); tp = tp[tp["turn_sequence"]<=30]
+    tp = df.groupby("turn_sequence")["compound"].mean().reset_index(); tp=tp[tp["turn_sequence"]<=30]
     fig = go.Figure()
-    fig.add_hline(y=0, line_dash="dash", line_color="rgba(255,255,255,0.15)")
-    fig.add_trace(go.Scatter(x=tp["turn_sequence"], y=tp["compound"], mode="lines+markers",
-                             line=dict(color="#4ecdc4",width=2.5), marker=dict(size=6,color="#4ecdc4"),
-                             fill="tozeroy", fillcolor="rgba(78,205,196,0.08)"))
-    fig.update_layout(**CHART_THEME, title="Avg Sentiment by Turn Position (first 30 turns)", title_font_size=14,
+    fig.add_hline(y=0,line_dash="dash",line_color="rgba(255,255,255,0.15)")
+    fig.add_trace(go.Scatter(x=tp["turn_sequence"],y=tp["compound"],mode="lines+markers",
+                             line=dict(color="#4ecdc4",width=2.5),marker=dict(size=6,color="#4ecdc4"),
+                             fill="tozeroy",fillcolor="rgba(78,205,196,0.08)"))
+    fig.update_layout(**CHART_THEME,title="Avg Sentiment by Turn Position (first 30 turns)",title_font_size=14,
                       xaxis=dict(title="Turn Number",       gridcolor="rgba(255,255,255,0.05)"),
-                      yaxis=dict(title="Avg Compound Score", gridcolor="rgba(255,255,255,0.05)")); return fig
+                      yaxis=dict(title="Avg Compound Score",gridcolor="rgba(255,255,255,0.05)")); return fig
 
 def _chart_escalation_resolution(df: pd.DataFrame) -> go.Figure:
     esc=int(df["potential_escalation"].sum()); res=int(df["potential_resolution"].sum())
     total=max(df["conversation_id"].nunique(),1)
-    fig = go.Figure(go.Bar(x=["Escalations","Resolutions"],y=[esc,res],marker_color=["#e74c3c","#2ecc71"],
-                           text=[f"{esc} ({esc/total:.0%})",f"{res} ({res/total:.0%})"],textposition="auto"))
+    fig=go.Figure(go.Bar(x=["Escalations","Resolutions"],y=[esc,res],marker_color=["#e74c3c","#2ecc71"],
+                         text=[f"{esc} ({esc/total:.0%})",f"{res} ({res/total:.0%})"],textposition="auto"))
     fig.update_layout(**CHART_THEME,title="Escalation & Resolution Events",title_font_size=14,showlegend=False,
                       yaxis=dict(gridcolor="rgba(255,255,255,0.05)")); return fig
 
 def _chart_conversation_heatmap(df: pd.DataFrame) -> go.Figure:
-    cm = df.groupby("conversation_id").agg(avg_sentiment=("compound","mean"),turns=("turn_sequence","max")).reset_index()
-    fig = px.scatter(cm,x="turns",y="avg_sentiment",color="avg_sentiment",color_continuous_scale="RdYlGn",
-                     range_color=[-1,1],hover_name="conversation_id",title="Conversation Performance Map",
-                     labels={"turns":"Conversation Length (turns)","avg_sentiment":"Avg Sentiment"})
+    cm=df.groupby("conversation_id").agg(avg_sentiment=("compound","mean"),turns=("turn_sequence","max")).reset_index()
+    fig=px.scatter(cm,x="turns",y="avg_sentiment",color="avg_sentiment",color_continuous_scale="RdYlGn",
+                   range_color=[-1,1],hover_name="conversation_id",title="Conversation Performance Map",
+                   labels={"turns":"Conversation Length (turns)","avg_sentiment":"Avg Sentiment"})
     fig.update_layout(**CHART_THEME,title_font_size=14); fig.update_coloraxes(colorbar=dict(thickness=10)); return fig
 
 def _chart_tbt_flow(df: pd.DataFrame, conv_id: str) -> go.Figure:
-    sub = df[df["conversation_id"]==conv_id].sort_values("turn_sequence")
-    fig = go.Figure()
-    fig.add_hline(y=0, line_dash="dash", line_color="rgba(255,255,255,0.15)")
-    fig.add_trace(go.Scatter(x=sub["turn_sequence"], y=sub["compound"], mode="lines+markers",
+    sub=df[df["conversation_id"]==conv_id].sort_values("turn_sequence")
+    fig=go.Figure()
+    fig.add_hline(y=0,line_dash="dash",line_color="rgba(255,255,255,0.15)")
+    fig.add_trace(go.Scatter(x=sub["turn_sequence"],y=sub["compound"],mode="lines+markers",
                              line=dict(color="#6c63ff",width=2.5),
                              marker=dict(size=9,color=sub["compound"],colorscale="RdYlGn",cmin=-1,cmax=1,
                                          showscale=True,colorbar=dict(thickness=10,title="Score")),
@@ -666,12 +709,12 @@ def _chart_tbt_flow(df: pd.DataFrame, conv_id: str) -> go.Figure:
                                    if len(r.message)>60 else f"Turn {r.turn_sequence}<br>{r.speaker}<br>{r.message}"
                                    for _,r in sub.iterrows()],
                              hovertemplate="%{text}<br>Score: %{y:.3f}<extra></extra>"))
-    mt = int(sub["turn_sequence"].max()) if not sub.empty else 1
+    mt=int(sub["turn_sequence"].max()) if not sub.empty else 1
     for pn,(s,e,color) in {"start":(1,3,"rgba(108,99,255,0.08)"),"middle":(4,max(4,mt-3),"rgba(78,205,196,0.06)"),
                             "end":(max(4,mt-2),mt,"rgba(255,107,107,0.08)")}.items():
         if s<=e: fig.add_vrect(x0=s-0.5,x1=e+0.5,fillcolor=color,line_width=0,
                                annotation_text=PHASE_ICONS[pn],annotation_position="top left")
-    fig.update_layout(**CHART_THEME, title=f"Turn-by-Turn Flow — {conv_id}", title_font_size=14,
+    fig.update_layout(**CHART_THEME,title=f"Turn-by-Turn Flow — {conv_id}",title_font_size=14,
                       xaxis=dict(title="Turn Sequence",  gridcolor="rgba(255,255,255,0.05)"),
                       yaxis=dict(title="Sentiment Score",range=[-1.1,1.1],gridcolor="rgba(255,255,255,0.05)")); return fig
 
@@ -717,14 +760,14 @@ def _render_kpi_row(insights: Dict[str, Any]) -> None:
     esc_c="#e74c3c" if cs["escalation_rate"]>0.15 else "#f39c12" if cs["escalation_rate"]>0.10 else "#2ecc71"
     res_c="#2ecc71" if cs["resolution_rate"]>0.6  else "#f39c12" if cs["resolution_rate"]>0.4  else "#e74c3c"
     html='<div class="metric-grid">'
-    html+=card("Conversations",   f"{insights['total_conversations']:,}")
-    html+=card("Total Turns",     f"{insights['total_turns']:,}",f"avg {insights['avg_turns_per_conversation']:.1f}/conv")
+    html+=card("Conversations",    f"{insights['total_conversations']:,}")
+    html+=card("Total Turns",      f"{insights['total_turns']:,}",f"avg {insights['avg_turns_per_conversation']:.1f}/conv")
     html+=card("Overall Sentiment",f'<span style="color:{_score_color(overall)}">{overall:+.3f}</span>')
-    html+=card("Customer Avg",    f'<span style="color:{_score_color(cs["average_sentiment"])}">{cs["average_sentiment"]:+.3f}</span>')
-    html+=card("Agent Avg",       f'<span style="color:{_score_color(ap["average_sentiment"])}">{ap["average_sentiment"]:+.3f}</span>')
-    html+=card("Escalation Rate", f'<span style="color:{esc_c}">{_fmt_pct(cs["escalation_rate"])}</span>')
-    html+=card("Resolution Rate", f'<span style="color:{res_c}">{_fmt_pct(cs["resolution_rate"])}</span>')
-    html+=card("Sentiment Trend", f'<span style="color:{_score_color(cp["sentiment_improvement"])}">{cp["sentiment_improvement"]:+.3f}</span>',"end − start")
+    html+=card("Customer Avg",     f'<span style="color:{_score_color(cs["average_sentiment"])}">{cs["average_sentiment"]:+.3f}</span>')
+    html+=card("Agent Avg",        f'<span style="color:{_score_color(ap["average_sentiment"])}">{ap["average_sentiment"]:+.3f}</span>')
+    html+=card("Escalation Rate",  f'<span style="color:{esc_c}">{_fmt_pct(cs["escalation_rate"])}</span>')
+    html+=card("Resolution Rate",  f'<span style="color:{res_c}">{_fmt_pct(cs["resolution_rate"])}</span>')
+    html+=card("Sentiment Trend",  f'<span style="color:{_score_color(cp["sentiment_improvement"])}">{cp["sentiment_improvement"]:+.3f}</span>',"end − start")
     html+="</div>"
     st.markdown(html, unsafe_allow_html=True)
 
@@ -766,6 +809,55 @@ def _render_recommendations(insights: Dict[str, Any]) -> None:
     for rec in insights.get("recommendations",[]):
         st.markdown(f'<div class="rec-card">{rec}</div>', unsafe_allow_html=True)
 
+def _render_export_section(df_results: pd.DataFrame, insights: dict) -> None:
+    """Prominent export section with three clearly labelled download buttons."""
+    st.markdown("### ⬇️ Download Results")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.markdown("""
+        <div class="export-card">
+            <div class="ex-title">📊 Excel Workbook</div>
+            <div class="ex-desc">All Turns · Customer · Agent · Summary (4 sheets)</div>
+        </div>""", unsafe_allow_html=True)
+        st.download_button(
+            label="📥 Download Excel (.xlsx)",
+            data=_to_excel(df_results, insights),
+            file_name=f"tbt_results_{ts}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+        )
+
+    with col2:
+        st.markdown("""
+        <div class="export-card">
+            <div class="ex-title">📄 CSV File</div>
+            <div class="ex-desc">All turns as a flat CSV — ready for Excel / BI tools</div>
+        </div>""", unsafe_allow_html=True)
+        st.download_button(
+            label="📥 Download CSV (.csv)",
+            data=_to_csv(df_results),
+            file_name=f"tbt_results_{ts}.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+    with col3:
+        st.markdown("""
+        <div class="export-card">
+            <div class="ex-title">📦 Full ZIP Bundle</div>
+            <div class="ex-desc">CSV + Excel + JSON insights in one archive</div>
+        </div>""", unsafe_allow_html=True)
+        st.download_button(
+            label="📥 Download ZIP (.zip)",
+            data=_to_zip(df_results, insights),
+            file_name=f"tbt_complete_{ts}.zip",
+            mime="application/zip",
+            width="stretch",
+        )
+
 def _render_landing() -> None:
     col_l, col_r = st.columns([1.2,1])
     with col_l:
@@ -797,7 +889,7 @@ transcripts and customer feedback across six domain formats.
                      "🔄 Interactive turn-by-turn flow chart + momentum chart",
                      "🗣️ Per-turn detail viewer with sentiment badges",
                      "💡 Automated business recommendations",
-                     "⬇️ One-click export (Excel + CSV + JSON ZIP)"]:
+                     "⬇️ Download as Excel, CSV, or ZIP"]:
             st.markdown(f"- {item}")
 
 
@@ -810,23 +902,48 @@ def _render_sidebar() -> tuple[str, Optional[object]]:
         st.markdown(
             '<div style="text-align:center;padding:.6rem 0 1.2rem">'
             '<span style="font-size:2rem">🎭</span>'
-            '<div style="color:#fff;font-weight:700;font-size:1.05rem;margin-top:.3rem">TbT Analytics</div>'
-            '<div style="color:#888;font-size:.78rem">Turn-by-Turn Sentiment</div></div>',
+            '<div style="color:#fff;font-weight:700;font-size:1.1rem;margin-top:.3rem">TbT Analytics</div>'
+            '<div style="color:#bbb;font-size:.82rem;margin-top:.2rem">Turn-by-Turn Sentiment</div>'
+            '</div>',
             unsafe_allow_html=True)
+
         st.markdown("### ⚙️ Configuration")
         domain_keys   = list(FORMAT_LABELS.keys())
         domain_labels = [FORMAT_LABELS[k] for k in domain_keys]
-        sel_idx = st.selectbox("Domain / Format", options=range(len(domain_keys)),
-                               format_func=lambda i: domain_labels[i], index=6,
-                               help="Select the transcript format or leave as Auto-Detect.")
+        sel_idx = st.selectbox(
+            "Domain / Format",
+            options=range(len(domain_keys)),
+            format_func=lambda i: domain_labels[i],
+            index=6,
+            help="Select the transcript format or leave as Auto-Detect.",
+        )
         dataset_type = domain_keys[sel_idx]
+
         st.markdown("---")
         st.markdown("### 📂 Upload Data")
-        uploaded = st.file_uploader("Upload CSV or Excel", type=["csv","xlsx","xls"],
-                                    help="Upload a file containing conversation transcripts or customer feedback.")
+        uploaded = st.file_uploader(
+            "Upload CSV or Excel",
+            type=["csv","xlsx","xls"],
+            help="Upload a file containing conversation transcripts or customer feedback.",
+        )
+
+        # Show uploaded file name clearly
+        if uploaded is not None:
+            st.markdown(
+                f'<div style="background:rgba(108,99,255,0.2);border:1px solid #6c63ff;'
+                f'border-radius:8px;padding:.5rem .75rem;margin-top:.5rem;">'
+                f'<span style="color:#aaa;font-size:.75rem">Loaded:</span><br>'
+                f'<span style="color:#fff;font-weight:600;font-size:.88rem">📄 {uploaded.name}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
         st.markdown("---")
-        st.markdown('<div style="color:#555;font-size:.72rem;text-align:center">'
-                    'Domain Agnostic · TbT Granular Sentiment v2.1</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div style="color:#888;font-size:.72rem;text-align:center">'
+            'Domain Agnostic · TbT Granular Sentiment v2.2</div>',
+            unsafe_allow_html=True,
+        )
     return dataset_type, uploaded
 
 
@@ -891,26 +1008,15 @@ def _tab_data_table(df_results: pd.DataFrame) -> None:
                                "potential_escalation","potential_resolution"] if c in df_tbl.columns]
     st.markdown(f"**{len(df_tbl):,} rows** after filters")
     st.dataframe(df_tbl[display_cols].reset_index(drop=True), width='stretch', height=450)
-    csv_buf=io.StringIO(); df_tbl[display_cols].to_csv(csv_buf,index=False)
-    st.download_button("⬇️ Download filtered CSV", data=csv_buf.getvalue(),
-                       file_name=f"tbt_filtered_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
 
-def _tab_recommendations(df_results: pd.DataFrame, insights: dict) -> None:
+def _tab_recommendations_and_export(df_results: pd.DataFrame, insights: dict) -> None:
     st.markdown("#### 💡 Automated Business Recommendations")
     _render_recommendations(insights)
     st.markdown("---")
+    _render_export_section(df_results, insights)
+    st.markdown("---")
     st.markdown("#### 📊 Raw Insights (JSON)")
     with st.expander("View full insights object"): st.json(insights)
-    st.markdown("---")
-    st.markdown("#### ⬇️ Export Results")
-    ts=datetime.now().strftime("%Y%m%d_%H%M%S"); col_dl1,col_dl2=st.columns(2)
-    with col_dl1:
-        st.download_button("📥 Download Excel (all sheets)", data=_to_excel(df_results,insights),
-                           file_name=f"tbt_results_{ts}.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width='stretch')
-    with col_dl2:
-        st.download_button("📥 Download ZIP (CSV + Excel + JSON)", data=_to_zip(df_results,insights),
-                           file_name=f"tbt_complete_{ts}.zip", mime="application/zip", width='stretch')
 
 
 # ===========================================================================
@@ -921,6 +1027,7 @@ def main() -> None:
     _render_header()
     dataset_type, uploaded = _render_sidebar()
 
+    # Load data
     df_raw: Optional[pd.DataFrame] = None
     source_label = ""
     if uploaded is not None:
@@ -933,6 +1040,7 @@ def main() -> None:
     if df_raw is None:
         _render_landing(); return
 
+    # Run pipeline (cached per data + domain)
     cache_key = f"results_{hash(df_raw.values.tobytes())}_{dataset_type}"
     if cache_key not in st.session_state:
         with st.spinner("🔄 Running TbT analysis pipeline…"):
@@ -943,26 +1051,32 @@ def main() -> None:
 
     df_results, insights, detected = st.session_state[cache_key]
 
+    # Status bar
     col_a, _, col_c = st.columns([3,2,1])
     with col_a:
-        st.markdown(f'<div style="color:#888;font-size:.82rem">{source_label} &nbsp;·&nbsp; '
-                    f'Format: <span style="color:#6c63ff;font-weight:600">{detected}</span></div>',
-                    unsafe_allow_html=True)
+        st.markdown(
+            f'<div style="color:#aaa;font-size:.82rem">{source_label} &nbsp;·&nbsp; '
+            f'Format: <span style="color:#6c63ff;font-weight:600">{detected}</span></div>',
+            unsafe_allow_html=True)
     with col_c:
-        st.download_button("⬇️ Export ZIP", data=_to_zip(df_results,insights),
-                           file_name=f"tbt_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                           mime="application/zip", width='stretch')
+        st.download_button(
+            "⬇️ Quick Export ZIP",
+            data=_to_zip(df_results,insights),
+            file_name=f"tbt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+            mime="application/zip",
+            width="stretch",
+        )
 
     st.markdown("---")
     _render_kpi_row(insights)
 
     tabs = st.tabs(["📊 Overview","🔄 Turn-by-Turn Flow","🗣️ Conversation Explorer",
-                    "📋 Data Table","💡 Recommendations"])
+                    "📋 Data Table","💡 Recommendations & Export"])
     with tabs[0]: _tab_overview(df_results, insights)
     with tabs[1]: _tab_tbt_flow(df_results)
     with tabs[2]: _tab_conversation_explorer(df_results)
     with tabs[3]: _tab_data_table(df_results)
-    with tabs[4]: _tab_recommendations(df_results, insights)
+    with tabs[4]: _tab_recommendations_and_export(df_results, insights)
 
 
 if __name__ == "__main__":
