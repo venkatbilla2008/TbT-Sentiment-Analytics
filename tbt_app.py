@@ -2,7 +2,7 @@
 tbt_app.py  —  Domain Agnostic Turn-by-Turn Sentiment Analytics  v3.0
 ======================================================================
 Fixes in v3.0
-  ✓ Health-check crash: replaced numba JIT with pure numpy (no compile delay)
+  ✓ Health-check crash: replaced JIT with pure numpy (no compile delay)
   ✓ Memory crash on 5000+ records: batched VADER scoring + gc.collect every 500 rows
   ✓ Large-file guard: hard cap at 50k turns; warns user before running
   ✓ Sidebar navigation (inspired by reference app) — no more tab overload
@@ -219,7 +219,7 @@ def apply_chart(fig: go.Figure, h: int = None) -> go.Figure:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MATH HELPERS  (pure numpy — no numba, no JIT compile delay on startup)
+# MATH HELPERS  (pure numpy — fast, no compile delay on startup)
 # ─────────────────────────────────────────────────────────────────────────────
 def _rolling_mean3(arr: np.ndarray) -> np.ndarray:
     r = np.empty(len(arr), dtype=np.float64)
@@ -618,7 +618,7 @@ def _chart_sentiment_dist(df):
     fig=px.bar(cnt,x="sentiment",y="count",color="sentiment",
                color_discrete_map={"positive":C['pos'],"neutral":C['neu'],"negative":C['neg']},
                title="Sentiment Distribution",labels={"sentiment":"","count":"Turns"})
-    fig.update_traces(marker_line_width=0,cornerradius=4)
+    fig.update_traces(marker_line_width=0)
     return apply_chart(fig.update_layout(showlegend=False,title_font_size=14))
 
 def _chart_speaker_box(df):
@@ -634,9 +634,9 @@ def _chart_phase_comparison(ins):
     pcd=ins.get("phase_csat_dsat",{}); phases=["Start","Middle","End"]
     fig=go.Figure(data=[
         go.Bar(name="CSAT %",x=phases,y=[pcd.get(p.lower(),{}).get("csat_pct",0)*100 for p in phases],
-               marker_color=C['pos'],marker_line_width=0,cornerradius=4),
+               marker_color=C['pos'],marker_line_width=0),
         go.Bar(name="DSAT %",x=phases,y=[pcd.get(p.lower(),{}).get("dsat_pct",0)*100 for p in phases],
-               marker_color=C['neg'],marker_line_width=0,cornerradius=4),
+               marker_color=C['neg'],marker_line_width=0),
     ])
     return apply_chart(fig.update_layout(barmode="group",title="CSAT vs DSAT by Phase",title_font_size=14,
         yaxis=dict(title="% Customer Turns"),legend=dict(orientation="h",yanchor="bottom",y=1.02)))
@@ -655,7 +655,7 @@ def _chart_escalation_resolution(df):
     esc=int(df["potential_escalation"].sum()); res=int(df["potential_resolution"].sum())
     tot=max(df["conversation_id"].nunique(),1)
     fig=go.Figure(go.Bar(x=["Escalations","Resolutions"],y=[esc,res],
-        marker_color=[C['neg'],C['pos']],marker_line_width=0,cornerradius=4,
+        marker_color=[C['neg'],C['pos']],marker_line_width=0,
         text=[f"{esc} ({esc/tot:.0%})",f"{res} ({res/tot:.0%})"],textposition="auto"))
     return apply_chart(fig.update_layout(title="Escalation & Resolution Events",title_font_size=14,showlegend=False))
 
@@ -695,7 +695,7 @@ def _chart_momentum(df, conv_id):
     sub=df[df["conversation_id"]==conv_id].sort_values("turn_sequence")
     colors=[C['pos'] if v>=0 else C['neg'] for v in sub["sentiment_momentum"]]
     fig=go.Figure(go.Bar(x=sub["turn_sequence"],y=sub["sentiment_momentum"],
-        marker_color=colors,marker_line_width=0,cornerradius=3,
+        marker_color=colors,marker_line_width=0,
         hovertemplate="Turn %{x}<br>Momentum: %{y:.3f}<extra></extra>"))
     fig.add_hline(y=0,line_dash="dash",line_color=C['warm'])
     return apply_chart(fig.update_layout(title=f"Sentiment Momentum — {conv_id}",
@@ -772,7 +772,7 @@ def render_landing():
     Granular Turn-by-Turn Analysis &nbsp;·&nbsp; Start → Middle → End &nbsp;·&nbsp; CSAT / DSAT per Phase</p>
   <div style="display:inline-flex;gap:.75rem;flex-wrap:wrap;justify-content:center">
     <span style="background:rgba(255,255,255,0.12);color:#fff;border-radius:999px;
-          padding:.35rem 1rem;font-size:.83rem;font-weight:500">✅ No numba dependency</span>
+          padding:.35rem 1rem;font-size:.83rem;font-weight:500">⚡ Fast startup</span>
     <span style="background:rgba(255,255,255,0.12);color:#fff;border-radius:999px;
           padding:.35rem 1rem;font-size:.83rem;font-weight:500">⚡ Handles 5k+ records</span>
     <span style="background:rgba(255,255,255,0.12);color:#fff;border-radius:999px;
