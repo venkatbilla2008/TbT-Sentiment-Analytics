@@ -989,83 +989,327 @@ def _chart_speaker_heatmap(df, conv_id):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LANDING PAGE
+# LANDING PAGE  — premium full-page design (adapted from reference app)
 # ─────────────────────────────────────────────────────────────────────────────
-def render_landing():
-    st.markdown(f"""
-<div style="background:linear-gradient(135deg,{C['text']} 0%,{C['teal']} 50%,{C['teal_l']} 100%);
-     border-radius:20px;padding:3.5rem 2.5rem 3rem;text-align:center;
-     box-shadow:0 12px 48px rgba(45,95,110,0.25);margin-bottom:2rem;">
-  <div style="font-size:3.2rem;margin-bottom:.5rem">🎭</div>
-  <h1 style="color:#fff;font-size:2.4rem;font-weight:700;margin:0 0 .6rem;letter-spacing:-.5px">
-    TbT Sentiment Analytics</h1>
-  <p style="color:{C['steel']};font-size:1.05rem;margin:0 0 1.8rem">
-    Granular Turn-by-Turn Analysis &nbsp;·&nbsp; Start → Middle → End &nbsp;·&nbsp; CSAT / DSAT per Phase</p>
-  <div style="display:inline-flex;gap:.75rem;flex-wrap:wrap;justify-content:center">
-    <span style="background:rgba(255,255,255,0.12);color:#fff;border-radius:999px;
-          padding:.35rem 1rem;font-size:.83rem;font-weight:500">⚡ Polars backend</span>
-    <span style="background:rgba(255,255,255,0.12);color:#fff;border-radius:999px;
-          padding:.35rem 1rem;font-size:.83rem;font-weight:500">🔀 Parallel VADER</span>
-    <span style="background:rgba(255,255,255,0.12);color:#fff;border-radius:999px;
-          padding:.35rem 1rem;font-size:.83rem;font-weight:500">🔒 5-stage cache</span>
-    <span style="background:rgba(255,255,255,0.12);color:#fff;border-radius:999px;
-          padding:.35rem 1rem;font-size:.83rem;font-weight:500">🔍 Auto-detect</span>
+
+LANDING_HTML = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+header[data-testid="stHeader"],footer,.stDeployButton,section[data-testid="stSidebar"]{display:none!important}
+.block-container{padding:0!important;max-width:100%!important}
+
+/* ── ANIMATIONS ── */
+@keyframes fadeUp{from{opacity:0;transform:translateY(40px)}to{opacity:1;transform:translateY(0)}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes gradSweep{0%{background-position:0% center}100%{background-position:200% center}}
+@keyframes pulse1{0%,100%{transform:translate(-50%,-50%) scale(1);opacity:.35}50%{transform:translate(-45%,-55%) scale(1.2);opacity:.55}}
+@keyframes pulse2{0%,100%{transform:translate(-50%,-50%) scale(1);opacity:.2}50%{transform:translate(-55%,-45%) scale(1.25);opacity:.4}}
+@keyframes pulse3{0%,100%{transform:translate(-50%,-50%) scale(1);opacity:.15}50%{transform:translate(-48%,-52%) scale(1.15);opacity:.3}}
+@keyframes float3d{0%,100%{transform:perspective(1000px) rotateX(2deg) rotateY(-1deg) translateY(0)}50%{transform:perspective(1000px) rotateX(-1deg) rotateY(1deg) translateY(-14px)}}
+@keyframes barG1{0%{width:0}100%{width:78%}}@keyframes barG2{0%{width:0}100%{width:62%}}
+@keyframes barG3{0%{width:0}100%{width:45%}}@keyframes barG4{0%{width:0}100%{width:30%}}
+@keyframes barG5{0%{width:0}100%{width:20%}}@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+@keyframes gridP{0%,100%{opacity:.04}50%{opacity:.08}}
+@keyframes typeLoop{0%,28%{content:"Start → Middle → End."}33%,61%{content:"CSAT / DSAT per Phase."}66%,94%{content:"Turn-by-Turn Insight."}100%{content:"Start → Middle → End."}}
+@keyframes nodeFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}
+@keyframes flowDot{0%{left:0;opacity:0}10%{opacity:1}90%{opacity:1}100%{left:100%;opacity:0}}
+@keyframes countUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+
+/* ── BASE ── */
+.lp *{margin:0;padding:0;box-sizing:border-box;font-family:'DM Sans',sans-serif}
+
+/* ── HERO ── */
+.lp-hero{position:relative;min-height:100vh;background:#0C1418;overflow:hidden;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:60px 24px}
+.lp-grd{position:absolute;inset:0;background-image:linear-gradient(rgba(168,188,200,.05) 1px,transparent 1px),linear-gradient(90deg,rgba(168,188,200,.05) 1px,transparent 1px);background-size:52px 52px;animation:gridP 8s ease-in-out infinite;z-index:1;pointer-events:none}
+.lp-o1{position:absolute;width:800px;height:800px;border-radius:50%;background:radial-gradient(circle,rgba(45,95,110,.45) 0%,transparent 70%);top:15%;left:20%;transform:translate(-50%,-50%);filter:blur(100px);animation:pulse1 10s ease-in-out infinite;z-index:0}
+.lp-o2{position:absolute;width:600px;height:600px;border-radius:50%;background:radial-gradient(circle,rgba(212,185,78,.3) 0%,transparent 70%);top:65%;left:75%;transform:translate(-50%,-50%);filter:blur(80px);animation:pulse2 12s ease-in-out infinite;z-index:0}
+.lp-o3{position:absolute;width:500px;height:500px;border-radius:50%;background:radial-gradient(circle,rgba(61,122,95,.25) 0%,transparent 70%);top:80%;left:30%;transform:translate(-50%,-50%);filter:blur(90px);animation:pulse3 14s ease-in-out infinite;z-index:0}
+.lp-bdg{position:relative;z-index:2;display:inline-flex;align-items:center;gap:6px;background:rgba(212,185,78,.08);color:#D4B94E;padding:8px 22px;border-radius:24px;font-size:11px;font-weight:600;letter-spacing:2px;border:1px solid rgba(212,185,78,.2);margin-bottom:32px;animation:fadeUp .7s ease-out both;backdrop-filter:blur(4px)}
+.lp-bdg::before{content:'';width:6px;height:6px;border-radius:50%;background:#D4B94E;box-shadow:0 0 8px rgba(212,185,78,.6)}
+.lp-ttl{position:relative;z-index:2;font-size:clamp(40px,7vw,78px);font-weight:700;line-height:1.05;text-align:center;margin-bottom:14px;letter-spacing:-1px;background:linear-gradient(90deg,#6B8A99,#E8E6DD 20%,#D4B94E 40%,#E8E6DD 60%,#A8BCC8 80%,#6B8A99);background-size:200% 100%;-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;animation:fadeUp .7s ease-out .15s both,gradSweep 5s linear infinite}
+.lp-sub{position:relative;z-index:2;font-size:20px;color:#A8BCC8;text-align:center;margin-bottom:8px;animation:fadeUp .7s ease-out .3s both;min-height:30px}
+.lp-sub::after{content:"Start → Middle → End.";animation:typeLoop 9s ease-in-out infinite;font-style:italic;color:#D4B94E}
+.lp-dsc{position:relative;z-index:2;font-size:15px;color:#4A6B78;text-align:center;max-width:600px;line-height:1.8;margin:8px auto 50px;animation:fadeUp .7s ease-out .45s both}
+
+/* ── GLASS MOCKUP ── */
+.lp-mk{position:relative;z-index:2;width:min(720px,92vw);margin:0 auto;animation:fadeUp .8s ease-out .6s both,float3d 7s ease-in-out 2s infinite}
+.lp-wn{background:rgba(22,36,42,.5);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);border:1px solid rgba(168,188,200,.12);border-radius:16px;overflow:hidden;box-shadow:0 40px 100px rgba(0,0,0,.5)}
+.lp-wh{display:flex;align-items:center;gap:8px;padding:16px 20px;background:rgba(12,20,24,.7);border-bottom:1px solid rgba(168,188,200,.08)}
+.lp-dt{width:12px;height:12px;border-radius:50%}.lp-dr{background:#A04040}.lp-dy{background:#D4B94E}.lp-dg{background:#3D7A5F}
+.lp-wt{font-size:12px;color:#4A6B78;margin-left:10px;font-family:'JetBrains Mono',monospace}
+.lp-wb{padding:24px;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:2;color:#6B8A99}
+.ck{color:#D4B94E}.cf{color:#A8BCC8}.cs{color:#3D7A5F}.cm{color:#3D5A66;font-style:italic}
+.lp-cur{display:inline-block;width:2px;height:14px;background:#D4B94E;animation:blink 1s step-end infinite;vertical-align:text-bottom;margin-left:2px}
+.lp-bars{margin-top:20px;padding-top:16px;border-top:1px solid rgba(168,188,200,.08);display:flex;flex-direction:column;gap:10px}
+.lp-br{display:flex;align-items:center;gap:12px}.lp-bl{width:120px;text-align:right;font-size:11px;color:#4A6B78}
+.lp-bt{flex:1;height:8px;background:rgba(168,188,200,.08);border-radius:4px;overflow:hidden}
+.lp-bf{height:100%;border-radius:4px}
+.lb1{background:linear-gradient(90deg,#2ecc71,#3D7A5F);animation:barG1 1.8s cubic-bezier(.4,0,.2,1) 1.4s both}
+.lb2{background:linear-gradient(90deg,#4682b4,#2D5F6E);animation:barG2 1.8s cubic-bezier(.4,0,.2,1) 1.6s both}
+.lb3{background:linear-gradient(90deg,#D4B94E,#E8D97A);animation:barG3 1.8s cubic-bezier(.4,0,.2,1) 1.8s both}
+.lb4{background:linear-gradient(90deg,#e74c3c,#A04040);animation:barG4 1.8s cubic-bezier(.4,0,.2,1) 2.0s both}
+.lb5{background:linear-gradient(90deg,#6B8A99,#A8BCC8);animation:barG5 1.8s cubic-bezier(.4,0,.2,1) 2.2s both}
+.lp-bp{width:44px;font-size:11px;color:#A8BCC8;font-family:'JetBrains Mono',monospace;text-align:right}
+
+/* ── PHASE BAND ── */
+.lp-ph{display:flex;gap:6px;margin-top:14px;padding-top:14px;border-top:1px solid rgba(168,188,200,.06)}
+.lp-ph-s{flex:1;border-radius:6px;padding:6px 10px;text-align:center;font-size:10px;font-weight:600;letter-spacing:.5px}
+.ph-start{background:rgba(45,95,110,.25);color:#3A7A8C}
+.ph-mid{background:rgba(212,185,78,.15);color:#D4B94E}
+.ph-end{background:rgba(160,64,64,.2);color:#c0726f}
+
+/* ── STATS ── */
+.lp-sts{position:relative;z-index:2;display:flex;justify-content:center;gap:48px;margin-top:56px;flex-wrap:wrap;animation:fadeUp .7s ease-out .8s both}
+.lp-st{text-align:center}.lp-sn{font-size:36px;font-weight:700;color:#E8E6DD;font-family:'JetBrains Mono',monospace;animation:countUp .5s ease-out 1.2s both}
+.lp-sn span{color:#D4B94E}.lp-sl{font-size:11px;color:#4A6B78;text-transform:uppercase;letter-spacing:1.5px;margin-top:4px}
+
+/* ── FEATURES ── */
+.lp-ft{background:#F5F4F0;padding:90px 40px;text-align:center}
+.lp-fh{font-size:34px;font-weight:700;color:#1E2D33;margin-bottom:16px}
+.lp-fsh{font-size:15px;color:#6B8A99;margin-bottom:52px;max-width:600px;margin-left:auto;margin-right:auto;line-height:1.6}
+.lp-fg{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:20px;max-width:1140px;margin:0 auto}
+.lp-fc{background:rgba(255,255,255,.7);backdrop-filter:blur(12px);border:1px solid rgba(209,207,196,.5);border-radius:16px;padding:36px 28px;transition:all .4s cubic-bezier(.25,.46,.45,.94);position:relative;overflow:hidden;text-align:left}
+.lp-fc::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,#2D5F6E,#D4B94E);transform:scaleX(0);transform-origin:left;transition:transform .4s}
+.lp-fc:hover{transform:translateY(-8px);box-shadow:0 20px 60px rgba(45,95,110,.12);background:rgba(255,255,255,.95);border-color:#2D5F6E}
+.lp-fc:hover::before{transform:scaleX(1)}
+.lp-fi{width:52px;height:52px;border-radius:14px;display:flex;align-items:center;justify-content:center;margin-bottom:20px;background:linear-gradient(135deg,#2D5F6E,#3A7A8C);box-shadow:0 6px 20px rgba(45,95,110,.25);transition:transform .3s;font-size:22px}
+.lp-fc:hover .lp-fi{transform:scale(1.08) rotate(-3deg)}
+.lp-fc h3{font-size:16px;font-weight:600;color:#1E2D33;margin-bottom:10px}.lp-fc p{font-size:13px;color:#6B8A99;line-height:1.7}
+
+/* ── HOW IT WORKS ── */
+.lp-hw{background:#0C1418;padding:90px 40px;position:relative;overflow:hidden}
+.lp-hw::before{content:'';position:absolute;inset:0;background-image:linear-gradient(rgba(168,188,200,.03) 1px,transparent 1px),linear-gradient(90deg,rgba(168,188,200,.03) 1px,transparent 1px);background-size:52px 52px;pointer-events:none}
+.lp-hwt{text-align:center;font-size:34px;font-weight:700;color:#E8E6DD;margin-bottom:16px;position:relative;z-index:1}
+.lp-hwst{text-align:center;font-size:14px;color:#4A6B78;margin-bottom:56px;position:relative;z-index:1}
+.lp-hws{display:flex;justify-content:center;gap:0;max-width:1000px;margin:0 auto;flex-wrap:wrap;position:relative;z-index:1;align-items:flex-start}
+.lp-stp{text-align:center;flex:1;min-width:220px;padding:36px 24px;background:rgba(22,36,42,.5);backdrop-filter:blur(12px);border:1px solid rgba(168,188,200,.08);border-radius:16px;transition:all .35s}
+.lp-stp:hover{border-color:rgba(212,185,78,.3);transform:translateY(-6px)}
+.lp-snm{width:56px;height:56px;border-radius:50%;background:linear-gradient(135deg,#D4B94E,#E8D97A);color:#1E2D33;font-size:24px;font-weight:700;display:flex;align-items:center;justify-content:center;margin:0 auto 20px;box-shadow:0 6px 28px rgba(212,185,78,.3);animation:nodeFloat 4s ease-in-out infinite}
+.lp-stp h4{font-size:17px;font-weight:600;color:#E8E6DD;margin-bottom:10px}.lp-stp p{font-size:13px;color:#6B8A99;line-height:1.65}
+.lp-conn{display:flex;align-items:center;padding-top:50px;width:60px;position:relative}
+.lp-conn::after{content:'';width:100%;height:2px;background:linear-gradient(90deg,rgba(212,185,78,.1),rgba(212,185,78,.4),rgba(212,185,78,.1))}
+.lp-conn .lp-dot{position:absolute;width:6px;height:6px;background:#D4B94E;border-radius:50%;animation:flowDot 2.5s ease-in-out infinite;box-shadow:0 0 8px rgba(212,185,78,.5)}
+
+/* ── COMPARISON ── */
+.lp-cmp{background:#F5F4F0;padding:90px 40px;text-align:center}
+.lp-cmpt{font-size:34px;font-weight:700;color:#1E2D33;margin-bottom:52px}
+.lp-cmptbl{max-width:820px;margin:0 auto;border-collapse:separate;border-spacing:0;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(45,95,110,.08)}
+.lp-cmptbl th{padding:16px 24px;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:1px}
+.lp-cmptbl th:first-child{background:#0C1418;color:#6B8A99;text-align:left;width:40%}
+.lp-cmptbl th:nth-child(2){background:#e8e6dd;color:#6B8A99}
+.lp-cmptbl th:nth-child(3){background:#2D5F6E;color:#fff}
+.lp-cmptbl td{padding:14px 24px;font-size:14px;border-bottom:1px solid #E8E6DD}
+.lp-cmptbl td:first-child{font-weight:500;color:#1E2D33;text-align:left;background:#fafaf8}
+.lp-cmptbl td:nth-child(2){color:#6B8A99;background:#fafaf8;text-align:center}
+.lp-cmptbl td:nth-child(3){color:#2D5F6E;font-weight:600;background:rgba(45,95,110,.04);text-align:center}
+.lp-cmptbl tr:last-child td{border-bottom:none}
+
+/* ── TECH STACK ── */
+.lp-tc{background:#0C1418;padding:52px 40px;text-align:center;border-top:1px solid rgba(168,188,200,.06)}
+.lp-tl{font-size:11px;color:#4A6B78;text-transform:uppercase;letter-spacing:2px;font-weight:600}
+.lp-tr{display:flex;justify-content:center;gap:12px;flex-wrap:wrap;margin-top:16px}
+.lp-tp{background:rgba(22,36,42,.5);border:1px solid rgba(168,188,200,.1);border-radius:8px;padding:9px 20px;font-size:13px;font-weight:500;color:#6B8A99;transition:all .25s;backdrop-filter:blur(4px)}
+.lp-tp:hover{border-color:#D4B94E;color:#D4B94E}
+
+/* ── CTA ── */
+.lp-cta{background:linear-gradient(135deg,#0C1418 0%,#162A32 100%);padding:80px 40px;text-align:center;position:relative;overflow:hidden}
+.lp-cta::before{content:'';position:absolute;width:500px;height:500px;border-radius:50%;background:radial-gradient(circle,rgba(212,185,78,.12) 0%,transparent 70%);top:50%;left:50%;transform:translate(-50%,-50%);filter:blur(60px);pointer-events:none}
+.lp-ctah{font-size:34px;font-weight:700;color:#E8E6DD;margin-bottom:12px;position:relative;z-index:1}
+.lp-ctap{font-size:15px;color:#4A6B78;margin-bottom:10px;position:relative;z-index:1}
+.lp-ctatrust{font-size:12px;color:#3D5A66;margin-top:20px;position:relative;z-index:1;letter-spacing:.5px}
+
+/* ── FOOTER ── */
+.lp-fo{background:#0C1418;padding:28px;text-align:center;font-size:12px;color:#3D5A66;border-top:1px solid rgba(168,188,200,.06)}
+</style>
+
+<div class="lp">
+
+<!-- ═══ HERO ═══ -->
+<div class="lp-hero">
+<div class="lp-grd"></div><div class="lp-o1"></div><div class="lp-o2"></div><div class="lp-o3"></div>
+
+<div class="lp-bdg">DOMAIN AGNOSTIC · TURN-BY-TURN ANALYTICS</div>
+<h1 class="lp-ttl">TbT Sentiment Analytics</h1>
+<p class="lp-sub">&nbsp;</p>
+<p class="lp-dsc">Transform raw conversation transcripts into granular sentiment intelligence. Phase-level CSAT/DSAT, escalation detection, and executive narratives — powered by Polars and parallel VADER scoring.</p>
+
+<!-- Glass Mockup -->
+<div class="lp-mk"><div class="lp-wn">
+<div class="lp-wh">
+  <div class="lp-dt lp-dr"></div><div class="lp-dt lp-dy"></div><div class="lp-dt lp-dg"></div>
+  <span class="lp-wt">pipeline.py — Parallel Sentiment Engine</span>
+</div>
+<div class="lp-wb">
+  <span class="cm"># Parallel VADER · 4 threads · vectorised labels</span><br>
+  <span class="ck">with</span> ThreadPoolExecutor(<span class="ck">max_workers</span>=<span class="cs">4</span>) <span class="ck">as</span> ex:<br>
+  &nbsp;&nbsp;futures = [ex.submit(_score_chunk, chunk) <span class="ck">for</span> chunk <span class="ck">in</span> chunks]<br>
+  &nbsp;&nbsp;labels = np.<span class="cf">where</span>(compound &gt;= thr[<span class="cs">"pos"</span>], <span class="cs">"positive"</span>, ...)<span class="lp-cur"></span>
+  <div class="lp-bars">
+    <div class="lp-br"><span class="lp-bl">🟢 Positive</span><div class="lp-bt"><div class="lp-bf lb1"></div></div><span class="lp-bp">CSAT</span></div>
+    <div class="lp-br"><span class="lp-bl">🔵 Neutral</span><div class="lp-bt"><div class="lp-bf lb2"></div></div><span class="lp-bp">stable</span></div>
+    <div class="lp-br"><span class="lp-bl">🟡 Escalation</span><div class="lp-bt"><div class="lp-bf lb3"></div></div><span class="lp-bp">⚠️</span></div>
+    <div class="lp-br"><span class="lp-bl">🔴 Negative</span><div class="lp-bt"><div class="lp-bf lb4"></div></div><span class="lp-bp">DSAT</span></div>
+    <div class="lp-br"><span class="lp-bl">⬛ Unknown</span><div class="lp-bt"><div class="lp-bf lb5"></div></div><span class="lp-bp">low</span></div>
+  </div>
+  <div class="lp-ph">
+    <div class="lp-ph-s ph-start">🚀 START PHASE</div>
+    <div class="lp-ph-s ph-mid">🔄 MIDDLE PHASE</div>
+    <div class="lp-ph-s ph-end">🏁 END PHASE</div>
   </div>
 </div>
-""", unsafe_allow_html=True)
+</div></div>
 
-    features=[
-        ("📊","KPI Dashboard","Conversations, turns, escalation rate, resolution rate & sentiment trend at a glance."),
-        ("📈","Phase CSAT/DSAT","CSAT % and DSAT % for Start, Middle and End phases independently."),
-        ("🔄","Turn-by-Turn Flow","Interactive chart showing the exact sentiment trajectory of each conversation."),
-        ("🌊","Waterfall Chart","Visual journey from Start → Middle → End with absolute and delta scores."),
-        ("🌐","Sunburst View","Hierarchical breakdown: Speaker → Phase → Sentiment label in one glance."),
-        ("⚡","Escalation Map","Timeline scatter of all escalation events across conversation positions."),
-        ("🗣️","Conversation Explorer","Turn-by-turn card viewer with badges, score bars and confidence %."),
-        ("💡","Narrative Intelligence","Auto-generated executive summary with data-driven recommendations."),
-        ("⬇️","Flexible Export","Excel (5 sheets), flat CSV, or a complete ZIP bundle."),
-    ]
-    cols=st.columns(3)
-    for i,(icon,title,desc) in enumerate(features):
-        with cols[i%3]:
-            st.markdown(f"""
-<div style="background:{C['card']};border:1px solid {C['border']};border-radius:12px;
-     padding:1.2rem;margin-bottom:1rem;border-top:3px solid {C['teal']};
-     box-shadow:0 2px 8px rgba(45,95,110,0.07);">
-  <div style="font-size:1.6rem;margin-bottom:.4rem">{icon}</div>
-  <div style="font-weight:600;color:{C['text']};font-size:.95rem;margin-bottom:.3rem">{title}</div>
-  <div style="color:{C['muted']};font-size:.83rem;line-height:1.55">{desc}</div>
-</div>""", unsafe_allow_html=True)
+<!-- Stats -->
+<div class="lp-sts">
+<div class="lp-st"><div class="lp-sn">6<span>+</span></div><div class="lp-sl">Domain Formats</div></div>
+<div class="lp-st"><div class="lp-sn">50<span>K</span></div><div class="lp-sl">Turns Supported</div></div>
+<div class="lp-st"><div class="lp-sn">4</div><div class="lp-sl">Parallel Threads</div></div>
+<div class="lp-st"><div class="lp-sn">5</div><div class="lp-sl">Cached Stages</div></div>
+</div>
+</div>
 
-    st.markdown("---")
-    c1,c2=st.columns([1,1.2])
-    with c1:
-        sh("📂","Supported Formats")
-        st.markdown(f"""
-<table class="pt"><thead><tr><th>Icon</th><th>Domain</th><th>Data Type</th></tr></thead><tbody>
-<tr><td>🎵</td><td>Media / Ent A</td><td>ISO-timestamp transcripts</td></tr>
-<tr><td>🎬</td><td>Media / Ent B</td><td>Bracket [HH:MM:SS] transcripts</td></tr>
-<tr><td>🏥</td><td>Healthcare A</td><td>Call transcripts [MM:SS]</td></tr>
-<tr><td>🩼</td><td>Healthcare B</td><td>Chat / SMS logs</td></tr>
-<tr><td>🚗</td><td>Transportation</td><td>Customer verbatim</td></tr>
-<tr><td>🏨</td><td>Travel</td><td>Guest feedback</td></tr>
-</tbody></table>""", unsafe_allow_html=True)
-    with c2:
-        sh("🚀","Getting Started")
-        st.markdown(f"""
-<div style="background:{C['card']};border:1px solid {C['border']};border-radius:10px;padding:1.2rem;">
-<ol style="color:{C['text2']};font-size:.92rem;line-height:2.2;margin:0;padding-left:1.2rem">
-<li>Select your <strong>Domain / Format</strong> in the sidebar<br>
-    <span style="color:{C['muted']};font-size:.82rem">(or leave as Auto-Detect)</span></li>
-<li>Upload a <strong>CSV or Excel</strong> file using the sidebar uploader</li>
-<li>Click <strong>▶ Run Analysis</strong></li>
-<li>Explore results across the five navigation sections</li>
-<li>Download your results in Excel, CSV, or ZIP</li>
-</ol></div>""", unsafe_allow_html=True)
+<!-- ═══ FEATURES ═══ -->
+<div class="lp-ft">
+<h2 class="lp-fh">Built for Conversation Intelligence</h2>
+<p class="lp-fsh">Everything you need to analyse, visualise, and act on conversation data — from turn-level sentiment to executive narratives.</p>
+<div class="lp-fg">
 
-    st.markdown(f'<div style="text-align:center;color:{C["muted"]};font-size:11px;padding:16px 0">'
-                f'TbT Sentiment Analytics v5.0 &nbsp;·&nbsp; Domain Agnostic &nbsp;·&nbsp; '
-                f'Polars + Parallel VADER + Streamlit</div>', unsafe_allow_html=True)
+<div class="lp-fc">
+<div class="lp-fi">📊</div>
+<h3>Phase-Level KPIs</h3>
+<p>CSAT % and DSAT % independently measured for Start, Middle and End phases. Know exactly when conversations fail.</p>
+</div>
+
+<div class="lp-fc">
+<div class="lp-fi">🔄</div>
+<h3>Turn-by-Turn Flow</h3>
+<p>Interactive Plotly chart mapping every conversation turn. Colour-coded by sentiment with phase band overlays and hover detail.</p>
+</div>
+
+<div class="lp-fc">
+<div class="lp-fi">🌊</div>
+<h3>Sentiment Waterfall</h3>
+<p>Start → Middle → End delta chart reveals exactly where sentiment improves or drops across the conversation arc.</p>
+</div>
+
+<div class="lp-fc">
+<div class="lp-fi">🌐</div>
+<h3>Sunburst Breakdown</h3>
+<p>Speaker → Phase → Sentiment hierarchy in a single interactive sunburst. Spot which role drives negativity at a glance.</p>
+</div>
+
+<div class="lp-fc">
+<div class="lp-fi">⚡</div>
+<h3>Escalation Detection</h3>
+<p>Rule-based escalation and resolution flagging. Timeline scatter maps every event across turn positions in all conversations.</p>
+</div>
+
+<div class="lp-fc">
+<div class="lp-fi">💡</div>
+<h3>Narrative Intelligence</h3>
+<p>Auto-generated executive summary with sentiment verdicts, phase breakdowns, and prioritised business recommendations.</p>
+</div>
+
+<div class="lp-fc">
+<div class="lp-fi">🔀</div>
+<h3>Parallel VADER Scoring</h3>
+<p>ThreadPoolExecutor with 4 workers, one VADER instance per thread. Vectorised numpy label assignment — no Python loops.</p>
+</div>
+
+<div class="lp-fc">
+<div class="lp-fi">⚙️</div>
+<h3>Polars Analytics</h3>
+<p>All groupbys, joins and aggregations run in Polars lazy frames. Rust internals — 5–10× faster than pandas on 50k+ rows.</p>
+</div>
+
+<div class="lp-fc">
+<div class="lp-fi">⬇️</div>
+<h3>Flexible Export</h3>
+<p>Download as Excel (5 sheets), flat CSV, or a complete ZIP bundle with insights JSON. Cached — instant re-download.</p>
+</div>
+
+</div>
+</div>
+
+<!-- ═══ HOW IT WORKS ═══ -->
+<div class="lp-hw">
+<h2 class="lp-hwt">Three Steps to Insight</h2>
+<p class="lp-hwst">From raw transcripts to CSAT/DSAT intelligence in under a minute.</p>
+<div class="lp-hws">
+<div class="lp-stp">
+  <div class="lp-snm">1</div>
+  <h4>Upload</h4>
+  <p>CSV or Excel with conversation transcripts or feedback. Auto-detects format across 6 domain types.</p>
+</div>
+<div class="lp-conn"><div class="lp-dot"></div></div>
+<div class="lp-stp">
+  <div class="lp-snm">2</div>
+  <h4>Analyse</h4>
+  <p>Parallel VADER scoring, Polars aggregations, phase classification. Full 50k-turn dataset in seconds.</p>
+</div>
+<div class="lp-conn"><div class="lp-dot"></div></div>
+<div class="lp-stp">
+  <div class="lp-snm">3</div>
+  <h4>Insight</h4>
+  <p>KPI dashboard, flow charts, waterfall, sunburst, narrative summaries, and one-click export.</p>
+</div>
+</div>
+</div>
+
+<!-- ═══ COMPARISON ═══ -->
+<div class="lp-cmp">
+<h2 class="lp-cmpt">Why TbT Sentiment Analytics?</h2>
+<table class="lp-cmptbl">
+<thead><tr><th>Capability</th><th>Manual / Spreadsheet</th><th>TbT Sentiment Analytics</th></tr></thead>
+<tbody>
+<tr><td>Scoring Speed</td><td>Hours per dataset</td><td>Seconds — parallel VADER</td></tr>
+<tr><td>Phase Analysis</td><td>Not possible</td><td>Start / Middle / End CSAT & DSAT</td></tr>
+<tr><td>Escalation Detection</td><td>Manual review</td><td>Auto-flagged every turn</td></tr>
+<tr><td>Domain Support</td><td>One format</td><td>6 formats, auto-detected</td></tr>
+<tr><td>Visualisations</td><td>Basic charts</td><td>Flow, Waterfall, Sunburst, Heatmap</td></tr>
+<tr><td>Executive Summary</td><td>Written manually</td><td>Auto-generated with recommendations</td></tr>
+<tr><td>Recompute on filter</td><td>Always</td><td>Never — 5-stage cache</td></tr>
+<tr><td>Setup Time</td><td>Days</td><td>Upload and click Run</td></tr>
+</tbody>
+</table>
+</div>
+
+<!-- ═══ TECH STACK ═══ -->
+<div class="lp-tc">
+<p class="lp-tl">Powered By</p>
+<div class="lp-tr">
+  <div class="lp-tp">Polars</div>
+  <div class="lp-tp">VADER Sentiment</div>
+  <div class="lp-tp">NumPy</div>
+  <div class="lp-tp">Plotly</div>
+  <div class="lp-tp">Streamlit</div>
+  <div class="lp-tp">ThreadPoolExecutor</div>
+  <div class="lp-tp">OpenPyXL</div>
+</div>
+</div>
+
+<!-- ═══ CTA ═══ -->
+<div class="lp-cta">
+<h2 class="lp-ctah">Ready to Analyse Your Conversations?</h2>
+<p class="lp-ctap">Upload your transcripts, click Run Analysis, and get phase-level sentiment intelligence instantly.</p>
+<p class="lp-ctatrust">No cloud dependency. Your data stays on your machine.</p>
+</div>
+
+<div class="lp-fo">TbT Sentiment Analytics v5.0 — Domain Agnostic · Turn-by-Turn Intelligence</div>
+</div>
+"""
+
+
+def render_landing():
+    """Full-page premium landing — hides sidebar and header, shows on 🏠 Home."""
+    st.markdown(LANDING_HTML, unsafe_allow_html=True)
+    # Launch button centred below the CTA
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    _, cc, _ = st.columns([1, 2, 1])
+    with cc:
+        if st.button("🚀 Launch Application", type="primary", width="stretch"):
+            st.session_state["page"] = "📊 Overview"
+            st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1359,7 +1603,8 @@ def main():
     if page == "🏠 Home" or not has_results:
         render_landing()
         if not has_results and page != "🏠 Home":
-            st.info("👆 Upload a file and click **▶ Run Analysis** to get started.")
+            # Sidebar still shows — user may be on an inner page without data
+            st.info("👆 Upload a file and click **▶ Run Analysis** in the sidebar to get started.")
         return
 
     df_r     = st.session_state["df_r"]
