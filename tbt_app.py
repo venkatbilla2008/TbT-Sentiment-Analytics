@@ -663,16 +663,29 @@ class AnalyticsEngine:
 # ─────────────────────────────────────────────────────────────────────────────
 # PIPELINE  — cached so UI interactions never recompute
 # ─────────────────────────────────────────────────────────────────────────────
+import hashlib
+
+def _file_checksum(file_bytes: bytes) -> str:
+    """SHA-256 of file bytes — used as a stable, unique cache key."""
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
 @st.cache_data(show_spinner=False)
-def _cached_parse(file_bytes: bytes, fname: str, dataset_type: str) -> pd.DataFrame:
-    """Parse raw bytes → turns DataFrame. Cached by file content + domain."""
+def _cached_parse(checksum: str, fname: str, dataset_type: str,
+                  file_bytes: bytes) -> pd.DataFrame:
+    """
+    Parse raw bytes → turns DataFrame.
+    Cache key = SHA-256 checksum + filename + domain.
+    Using checksum (not raw bytes) as first arg guarantees Streamlit hashes
+    a short string rather than a potentially huge bytes object — preventing
+    false cache hits when the internal hash truncates large files.
+    """
     if fname.endswith(".csv"):
         df_raw = pd.read_csv(io.BytesIO(file_bytes))
     else:
         df_raw = pd.read_excel(io.BytesIO(file_bytes))
-    proc = ConversationProcessor(dataset_type=dataset_type)
-    df_p = proc.parse(df_raw)
-    # Store detected format in a special column for retrieval
+    proc  = ConversationProcessor(dataset_type=dataset_type)
+    df_p  = proc.parse(df_raw)
     df_p.attrs["detected_format"] = proc.detected_format
     return df_p
 
@@ -709,14 +722,16 @@ def run_pipeline(
 
     Cache behaviour
     ---------------
-    _cached_parse   : busted when file bytes OR domain changes
-    _cached_score   : busted when parsed DataFrame changes
+    _cached_parse    : busted when SHA-256 checksum OR domain changes
+    _cached_score    : busted when parsed DataFrame changes
     _cached_analytics: busted when scored DataFrame changes
-    _precompute_aggs: busted when results DataFrame changes
-    UI interactions : recompute NOTHING (all stages already cached)
+    _precompute_aggs : busted when results DataFrame changes
+    UI interactions  : recompute NOTHING (all stages already cached)
     """
+    checksum = _file_checksum(file_bytes)
+
     if progress_bar: progress_bar.progress(0.10, text="Parsing transcripts…")
-    df_p     = _cached_parse(file_bytes, fname, dataset_type)
+    df_p     = _cached_parse(checksum, fname, dataset_type, file_bytes)
     detected = df_p.attrs.get("detected_format", "—")
 
     # Safety cap
@@ -1355,8 +1370,38 @@ def render_sidebar():
 
         st.markdown("---")
         run = st.button("▶ Run Analysis", type="primary", key="run_btn")
-        st.markdown(f'<div style="color:{C["muted"]};font-size:.7rem;text-align:center;padding-top:.5rem">'
-                    f'v5.0 — Polars · Parallel VADER · 5-stage Cache</div>', unsafe_allow_html=True)
+
+        # ── Clear cache button — shown when results exist ──
+        if "df_r" in st.session_state:
+            st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+            if st.button("🗑️ Clear & Reset", key="clear_btn", type="secondary"):
+                # Wipe all cached data and session results
+                st.cache_data.clear()
+                for k in ("df_r","ins","detected","fname",
+                          "_file_checksum","_dataset_type"):
+                    st.session_state.pop(k, None)
+                st.session_state["page"] = "🏠 Home"
+                st.rerun()
+
+            # Show active file + record count as a sanity check
+            fname_active = st.session_state.get("fname","")
+            n_turns      = len(st.session_state["df_r"])
+            n_convs      = st.session_state["ins"]["total_conversations"]
+            st.markdown(
+                f'<div style="background:rgba(45,95,110,0.08);border:1px solid {C["teal"]};'
+                f'border-radius:8px;padding:.5rem .75rem;margin-top:.4rem;font-size:.75rem">'
+                f'<div style="color:{C["muted"]}">Active dataset:</div>'
+                f'<div style="color:{C["text"]};font-weight:600">📄 {fname_active}</div>'
+                f'<div style="color:{C["teal"]}">{n_convs:,} conversations · {n_turns:,} turns</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        st.markdown(
+            f'<div style="color:{C["muted"]};font-size:.7rem;text-align:center;padding-top:.5rem">'
+            f'v5.0 — Polars · Parallel VADER · 5-stage Cache</div>',
+            unsafe_allow_html=True,
+        )
 
     return dataset_type, uploaded, run
 
@@ -1596,6 +1641,20 @@ def main():
     if uploaded is not None and run_clicked:
         try:
             file_bytes = uploaded.read()
+            checksum   = _file_checksum(file_bytes)
+
+            # ── Bust stale session results whenever file or domain changes ──
+            # This is the second line of defence (first is the SHA-256 cache key).
+            # If the user uploads a *different* file with the same name the
+            # session_state would still hold the old df_r/ins — wipe them first.
+            prev_checksum = st.session_state.get("_file_checksum")
+            prev_domain   = st.session_state.get("_dataset_type")
+            if checksum != prev_checksum or dataset_type != prev_domain:
+                for k in ("df_r", "ins", "detected", "fname"):
+                    st.session_state.pop(k, None)
+                # Also clear all @st.cache_data caches so nothing is stale
+                st.cache_data.clear()
+
             pb = st.progress(0, text="Starting pipeline…")
             try:
                 df_r, ins, detected = run_pipeline(
@@ -1605,8 +1664,9 @@ def main():
                 st.session_state.update({
                     "df_r": df_r, "ins": ins,
                     "detected": detected, "fname": uploaded.name,
+                    "_file_checksum": checksum,
+                    "_dataset_type":  dataset_type,
                 })
-                # Stay on Overview after first run
                 if st.session_state.get("page") in ("🏠 Home", "📊 Overview"):
                     st.session_state["page"] = "📊 Overview"
                 st.rerun()
