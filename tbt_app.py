@@ -1577,65 +1577,94 @@ def page_narrative_export(df_r, ins):
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    if "page" not in st.session_state: st.session_state["page"] = "🏠 Home"
+    # Initialise page state
+    if "page" not in st.session_state:
+        st.session_state["page"] = "🏠 Home"
 
+    page = st.session_state.get("page", "🏠 Home")
+
+    # ── Landing page — rendered BEFORE sidebar so its CSS (which hides the
+    #    sidebar) never interferes with the app layout on inner pages.
+    if page == "🏠 Home":
+        render_landing()
+        return
+
+    # ── Inner app pages — sidebar rendered only here ──────────────────────────
     dataset_type, uploaded, run_clicked = render_sidebar()
 
+    # ── Run pipeline when user clicks ▶ Run Analysis ──────────────────────────
     if uploaded is not None and run_clicked:
         try:
             file_bytes = uploaded.read()
             pb = st.progress(0, text="Starting pipeline…")
             try:
-                df_r, ins, detected = run_pipeline(file_bytes, uploaded.name, dataset_type, progress_bar=pb)
+                df_r, ins, detected = run_pipeline(
+                    file_bytes, uploaded.name, dataset_type, progress_bar=pb
+                )
                 pb.empty()
-                st.session_state.update({"df_r":df_r,"ins":ins,"detected":detected,"fname":uploaded.name})
-                if st.session_state.get("page") == "🏠 Home":
+                st.session_state.update({
+                    "df_r": df_r, "ins": ins,
+                    "detected": detected, "fname": uploaded.name,
+                })
+                # Stay on Overview after first run
+                if st.session_state.get("page") in ("🏠 Home", "📊 Overview"):
                     st.session_state["page"] = "📊 Overview"
                 st.rerun()
             except Exception as exc:
-                pb.empty(); st.error(f"Analysis failed: {exc}"); st.exception(exc); return
+                pb.empty()
+                st.error(f"Analysis failed: {exc}")
+                st.exception(exc)
+                return
         except Exception as exc:
-            st.error(f"Could not read file: {exc}"); return
+            st.error(f"Could not read file: {exc}")
+            return
 
-    page        = st.session_state.get("page","🏠 Home")
+    # ── Guard: no results yet → show upload prompt ────────────────────────────
     has_results = "df_r" in st.session_state and "ins" in st.session_state
-
-    if page == "🏠 Home" or not has_results:
-        render_landing()
-        if not has_results and page != "🏠 Home":
-            # Sidebar still shows — user may be on an inner page without data
-            st.info("👆 Upload a file and click **▶ Run Analysis** in the sidebar to get started.")
+    if not has_results:
+        st.markdown("<br>" * 4, unsafe_allow_html=True)
+        st.info("👆 Upload a file in the sidebar and click **▶ Run Analysis** to get started.")
         return
 
+    # ── Result pages ──────────────────────────────────────────────────────────
     df_r     = st.session_state["df_r"]
     ins      = st.session_state["ins"]
-    detected = st.session_state.get("detected","—")
-    fname    = st.session_state.get("fname","")
+    detected = st.session_state.get("detected", "—")
+    fname    = st.session_state.get("fname", "")
 
-    ca,_,cc=st.columns([3,2,1])
+    # Status bar
+    ca, _, cc = st.columns([3, 2, 1])
     with ca:
-        st.markdown(f'<div style="color:{C["muted"]};font-size:.82rem">'
-                    f'📂 {fname} &nbsp;·&nbsp; '
-                    f'Format: <strong style="color:{C["teal"]}">{detected}</strong></div>',
-                    unsafe_allow_html=True)
+        st.markdown(
+            f'<div style="color:{C["muted"]};font-size:.82rem">'
+            f'📂 {fname} &nbsp;·&nbsp; '
+            f'Format: <strong style="color:{C["teal"]}">{detected}</strong></div>',
+            unsafe_allow_html=True,
+        )
     with cc:
-        st.download_button("⬇️ Quick ZIP", data=_to_zip(df_r,ins),
+        st.download_button(
+            "⬇️ Quick ZIP",
+            data=_to_zip(df_r, ins),
             file_name=f"tbt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-            mime="application/zip", width="stretch")
+            mime="application/zip",
+            width="stretch",
+        )
 
     st.markdown("---")
     _kpi_row(ins)
     st.markdown("---")
 
-    if   page == "📊 Overview":             page_overview(df_r, ins)
-    elif page == "🔄 TbT Flow":             page_tbt_flow(df_r)
-    elif page == "🗣️ Explorer":             page_explorer(df_r)
-    elif page == "📋 Data Table":           page_data_table(df_r)
-    elif page == "💡 Narrative & Export":   page_narrative_export(df_r, ins)
+    if   page == "📊 Overview":           page_overview(df_r, ins)
+    elif page == "🔄 TbT Flow":           page_tbt_flow(df_r)
+    elif page == "🗣️ Explorer":           page_explorer(df_r)
+    elif page == "📋 Data Table":         page_data_table(df_r)
+    elif page == "💡 Narrative & Export": page_narrative_export(df_r, ins)
 
-    st.markdown(f'<div style="text-align:center;color:{C["muted"]};font-size:11px;padding:16px 0">'
-                f'TbT Sentiment Analytics v5.0 &nbsp;·&nbsp; Domain Agnostic</div>',
-                unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="text-align:center;color:{C["muted"]};font-size:11px;padding:16px 0">'
+        f'TbT Sentiment Analytics v5.0 &nbsp;·&nbsp; Domain Agnostic</div>',
+        unsafe_allow_html=True,
+    )
 
 
 if __name__ == "__main__":
