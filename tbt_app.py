@@ -959,26 +959,96 @@ def _chart_escalation_timeline(aggs):
     return apply_chart(fig.update_layout(title_font_size=14,
         xaxis=dict(title="Position (0=start, 1=end)"),yaxis=dict(title="")))
 
-def _chart_tbt_flow(df, conv_id):
-    sub=df[df["conversation_id"]==conv_id].sort_values("turn_sequence")
-    fig=go.Figure()
-    fig.add_hline(y=0,line_dash="dash",line_color=C['warm'])
-    fig.add_trace(go.Scatter(x=sub["turn_sequence"],y=sub["compound"],mode="lines+markers",
-        line=dict(color=C['teal'],width=2.5),
-        marker=dict(size=9,color=sub["compound"],colorscale="RdYlGn",cmin=-1,cmax=1,
-                    showscale=True,colorbar=dict(thickness=10,title="Score")),
-        text=[f"Turn {r.turn_sequence}<br>{r.speaker}<br>{r.message[:55]}…"
-              if len(r.message)>55 else f"Turn {r.turn_sequence}<br>{r.speaker}<br>{r.message}"
-              for _,r in sub.iterrows()],
-        hovertemplate="%{text}<br>Score: %{y:.3f}<extra></extra>"))
-    mt=int(sub["turn_sequence"].max()) if not sub.empty else 1
-    for pn,(s,e,col) in {"start":(1,3,"rgba(45,95,110,0.08)"),
-                          "middle":(4,max(4,mt-3),"rgba(212,185,78,0.06)"),
-                          "end":(max(4,mt-2),mt,"rgba(160,64,64,0.08)")}.items():
-        if s<=e: fig.add_vrect(x0=s-.5,x1=e+.5,fillcolor=col,line_width=0,
-                               annotation_text=PHASE_ICONS[pn],annotation_position="top left")
-    return apply_chart(fig.update_layout(title=f"Turn-by-Turn Flow — {conv_id}",title_font_size=14,
-        xaxis=dict(title="Turn"),yaxis=dict(title="Score",range=[-1.1,1.1])))
+def _chart_tbt_flow(df, conv_id, show_speaker_lines: bool = True):
+    """
+    Turn-by-Turn flow chart.
+
+    When show_speaker_lines=True: stacked lines per speaker (Customer teal,
+    Agent red) instead of a single combined line — reveals divergence clearly.
+    Escalation turns get vertical red dashed marker lines.
+    Phase bands always rendered.
+    """
+    sub = df[df["conversation_id"] == conv_id].sort_values("turn_sequence")
+    if sub.empty: return go.Figure()
+
+    fig = go.Figure()
+    fig.add_hline(y=0, line_dash="dash", line_color=C['warm'], line_width=1)
+
+    if show_speaker_lines:
+        # ── Stacked speaker lines ──
+        for role, color, dash in [
+            ("CUSTOMER", C['neg'],  "solid"),
+            ("AGENT",    C['teal'], "dot"),
+        ]:
+            rs = sub[sub["speaker"] == role]
+            if rs.empty: continue
+            fig.add_trace(go.Scatter(
+                x=rs["turn_sequence"], y=rs["compound"],
+                mode="lines+markers",
+                name=role.capitalize(),
+                line=dict(color=color, width=2.5, dash=dash),
+                marker=dict(size=8, color=color,
+                            line=dict(width=1.5, color="white")),
+                text=[f"Turn {r.turn_sequence}<br>{r.speaker}<br>"
+                      f"{r.message[:55]}…" if len(r.message)>55
+                      else f"Turn {r.turn_sequence}<br>{r.speaker}<br>{r.message}"
+                      for _, r in rs.iterrows()],
+                hovertemplate="%{text}<br>Score: %{y:.3f}<extra></extra>",
+            ))
+    else:
+        # ── Single combined line (original style) ──
+        fig.add_trace(go.Scatter(
+            x=sub["turn_sequence"], y=sub["compound"],
+            mode="lines+markers", name="All turns",
+            line=dict(color=C['teal'], width=2.5),
+            marker=dict(size=9, color=sub["compound"],
+                        colorscale="RdYlGn", cmin=-1, cmax=1,
+                        showscale=True, colorbar=dict(thickness=10, title="Score")),
+            text=[f"Turn {r.turn_sequence}<br>{r.speaker}<br>"
+                  f"{r.message[:55]}…" if len(r.message)>55
+                  else f"Turn {r.turn_sequence}<br>{r.speaker}<br>{r.message}"
+                  for _, r in sub.iterrows()],
+            hovertemplate="%{text}<br>Score: %{y:.3f}<extra></extra>",
+        ))
+
+    # ── Phase bands ──
+    mt = int(sub["turn_sequence"].max())
+    for pn, (s, e, col) in {
+        "start":  (1, 3,            "rgba(45,95,110,0.08)"),
+        "middle": (4, max(4, mt-3), "rgba(212,185,78,0.06)"),
+        "end":    (max(4, mt-2), mt, "rgba(160,64,64,0.08)"),
+    }.items():
+        if s <= e:
+            fig.add_vrect(x0=s-.5, x1=e+.5, fillcolor=col, line_width=0,
+                          annotation_text=PHASE_ICONS[pn],
+                          annotation_position="top left")
+
+    # ── Escalation markers — vertical red dashed lines ──
+    esc_turns = sub[sub["potential_escalation"] == True]["turn_sequence"].tolist()
+    for t in esc_turns:
+        fig.add_vline(
+            x=t, line_dash="dash", line_color=C['neg'], line_width=1.5,
+            annotation_text="⚠️", annotation_position="top right",
+            annotation_font_size=11,
+        )
+
+    # ── Resolution markers — vertical green dashed lines ──
+    res_turns = sub[sub["potential_resolution"] == True]["turn_sequence"].tolist()
+    for t in res_turns:
+        fig.add_vline(
+            x=t, line_dash="dot", line_color=C['pos'], line_width=1.5,
+            annotation_text="✅", annotation_position="bottom right",
+            annotation_font_size=11,
+        )
+
+    return apply_chart(fig.update_layout(
+        title=f"Turn-by-Turn Flow — {conv_id}",
+        title_font_size=14,
+        xaxis=dict(title="Turn"),
+        yaxis=dict(title="Sentiment Score", range=[-1.1, 1.1]),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                    xanchor="right", x=1),
+    ))
 
 def _chart_momentum(df, conv_id):
     sub=df[df["conversation_id"]==conv_id].sort_values("turn_sequence")
@@ -992,15 +1062,167 @@ def _chart_momentum(df, conv_id):
         xaxis=dict(title="Turn"),yaxis=dict(title="Momentum")))
 
 def _chart_speaker_heatmap(df, conv_id):
-    sub=df[df["conversation_id"]==conv_id]
-    pivot=(sub.groupby(["speaker","phase"])["compound"].mean()
-              .unstack(fill_value=0).reindex(columns=["start","middle","end"],fill_value=0))
-    fig=go.Figure(go.Heatmap(z=pivot.values,x=["Start","Middle","End"],y=pivot.index.tolist(),
-        colorscale="RdYlGn",zmin=-1,zmax=1,
-        text=[[f"{v:+.2f}" for v in row] for row in pivot.values],
-        texttemplate="%{text}",showscale=True,colorbar=dict(thickness=10),xgap=3,ygap=3))
-    return apply_chart(fig.update_layout(title=f"Speaker × Phase Heatmap — {conv_id}",
-        title_font_size=14,xaxis=dict(title="Phase"),yaxis=dict(title="")))
+    """Speaker × Phase heatmap — avg sentiment + turn count overlay."""
+    sub   = df[df["conversation_id"] == conv_id]
+    grp   = sub.groupby(["speaker", "phase"])
+    avg   = grp["compound"].mean().unstack(fill_value=0).reindex(columns=["start","middle","end"], fill_value=0)
+    cnt   = grp.size().unstack(fill_value=0).reindex(columns=["start","middle","end"], fill_value=0)
+
+    # Text: sentiment avg + turn count underneath
+    text = [[f"{avg.loc[spk, ph]:+.2f}<br><span style='font-size:10px'>({int(cnt.loc[spk, ph])} turns)</span>"
+             if spk in avg.index and ph in avg.columns else ""
+             for ph in ["start","middle","end"]]
+            for spk in avg.index]
+
+    fig = go.Figure(go.Heatmap(
+        z=avg.values, x=["Start","Middle","End"], y=avg.index.tolist(),
+        colorscale="RdYlGn", zmin=-1, zmax=1,
+        text=[[f"{avg.values[i][j]:+.2f} ({int(cnt.values[i][j])} turns)"
+               for j in range(3)] for i in range(len(avg))],
+        texttemplate="%{text}",
+        showscale=True, colorbar=dict(thickness=10), xgap=3, ygap=3,
+    ))
+    return apply_chart(fig.update_layout(
+        title=f"Speaker × Phase Heatmap — {conv_id}  (avg score · turn count)",
+        title_font_size=14, xaxis=dict(title="Phase"), yaxis=dict(title=""),
+    ))
+
+
+def _chart_compare_two(df: pd.DataFrame, conv_a: str, conv_b: str) -> go.Figure:
+    """
+    Side-by-side sentiment trajectory for two conversations on the same axes.
+    Uses turn_position (0–1) so different-length conversations align.
+    """
+    fig = go.Figure()
+    fig.add_hline(y=0, line_dash="dash", line_color=C['warm'], line_width=1)
+
+    palette = [(conv_a, C['teal'], "solid"), (conv_b, C['gold'], "dash")]
+    for cid, color, dash in palette:
+        sub = df[df["conversation_id"] == cid].sort_values("turn_sequence")
+        if sub.empty: continue
+        fig.add_trace(go.Scatter(
+            x=sub["turn_position"], y=sub["compound"],
+            mode="lines+markers", name=cid,
+            line=dict(color=color, width=2.5, dash=dash),
+            marker=dict(size=7, color=color),
+            hovertemplate=f"<b>{cid}</b><br>Position: %{{x:.2f}}<br>Score: %{{y:.3f}}<extra></extra>",
+        ))
+
+    return apply_chart(fig.update_layout(
+        title=f"Conversation Comparison — {conv_a} vs {conv_b}",
+        title_font_size=14,
+        xaxis=dict(title="Turn Position (0=start, 1=end)"),
+        yaxis=dict(title="Sentiment Score", range=[-1.1, 1.1]),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    ))
+
+
+def _chart_replay_animation(df: pd.DataFrame, conv_id: str) -> go.Figure:
+    """
+    Animated 'replay' of a conversation turn by turn using Plotly frames.
+    Each frame adds one more turn to a cumulative line so users can watch
+    sentiment evolve step by step with the Play button.
+    """
+    sub = df[df["conversation_id"] == conv_id].sort_values("turn_sequence").reset_index(drop=True)
+    if sub.empty or len(sub) < 2: return go.Figure()
+
+    turns = sub["turn_sequence"].tolist()
+    scores = sub["compound"].tolist()
+
+    # Build one frame per turn (cumulative)
+    frames = []
+    for i in range(1, len(turns) + 1):
+        frames.append(go.Frame(
+            data=[go.Scatter(
+                x=turns[:i], y=scores[:i],
+                mode="lines+markers",
+                line=dict(color=C['teal'], width=2.5),
+                marker=dict(
+                    size=9,
+                    color=scores[:i],
+                    colorscale="RdYlGn", cmin=-1, cmax=1,
+                ),
+            )],
+            name=str(turns[i-1]),
+        ))
+
+    fig = go.Figure(
+        data=[go.Scatter(x=turns[:1], y=scores[:1], mode="lines+markers",
+                         line=dict(color=C['teal'], width=2.5),
+                         marker=dict(size=9, color=scores[:1],
+                                     colorscale="RdYlGn", cmin=-1, cmax=1,
+                                     showscale=True, colorbar=dict(thickness=10)))],
+        frames=frames,
+    )
+    fig.add_hline(y=0, line_dash="dash", line_color=C['warm'], line_width=1)
+
+    fig.update_layout(
+        updatemenus=[dict(
+            type="buttons", showactive=False,
+            y=1.15, x=0, xanchor="left",
+            buttons=[
+                dict(label="▶ Play",  method="animate",
+                     args=[None, {"frame":{"duration":400,"redraw":True},
+                                  "fromcurrent":True,"transition":{"duration":200}}]),
+                dict(label="⏸ Pause", method="animate",
+                     args=[[None], {"frame":{"duration":0,"redraw":False},
+                                    "mode":"immediate","transition":{"duration":0}}]),
+            ],
+        )],
+        sliders=[dict(
+            steps=[dict(method="animate", args=[[f.name],
+                        {"mode":"immediate","frame":{"duration":300,"redraw":True},
+                         "transition":{"duration":100}}],
+                        label=f"Turn {f.name}") for f in frames],
+            active=0, y=0, x=0, len=1.0,
+            currentvalue=dict(prefix="Turn: ", visible=True, xanchor="center"),
+            transition=dict(duration=200),
+        )],
+        title=f"▶ Replay — {conv_id}",
+        title_font_size=14,
+        xaxis=dict(title="Turn", range=[turns[0]-.5, turns[-1]+.5]),
+        yaxis=dict(title="Score", range=[-1.1, 1.1]),
+    )
+    return apply_chart(fig)
+
+
+@st.cache_data(show_spinner=False)
+def _get_smart_conv_lists(df: pd.DataFrame) -> Dict[str, list]:
+    """
+    Pre-compute curated conversation lists — cached per DataFrame.
+
+    Returns
+    -------
+    worst10  : 10 conversations with lowest avg customer sentiment
+    best10   : 10 with highest avg customer sentiment
+    longest20: 20 longest by turn count
+    all_ids  : all conversation IDs sorted
+    """
+    lf = pl.from_pandas(df).lazy()
+
+    conv_stats = (
+        lf.group_by("conversation_id")
+          .agg([
+              pl.col("compound").mean().alias("avg_sentiment"),
+              pl.len().alias("n_turns"),
+              (pl.col("speaker") == "CUSTOMER").sum().alias("cu_turns"),
+          ])
+          .collect()
+    )
+    cu_stats = (
+        lf.filter(pl.col("speaker") == "CUSTOMER")
+          .group_by("conversation_id")
+          .agg(pl.col("compound").mean().alias("cu_avg"))
+          .collect()
+    )
+    merged = conv_stats.join(cu_stats, on="conversation_id", how="left")
+
+    worst20  = (merged.sort("cu_avg").head(20)["conversation_id"].to_list())
+    best20   = (merged.sort("cu_avg", descending=True).head(20)["conversation_id"].to_list())
+    longest20= (merged.sort("n_turns", descending=True).head(20)["conversation_id"].to_list())
+    all_ids  = sorted(merged["conversation_id"].to_list())
+
+    return {"worst20": worst20, "best20": best20, "longest20": longest20, "all_ids": all_ids}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1511,24 +1733,117 @@ def page_overview(df_r, ins):
 
 # ─── TbT Flow ────────────────────────────────────────────────────────────────
 def page_tbt_flow(df_r):
-    sh("🔄","Turn-by-Turn Sentiment Flow")
-    conv_ids=sorted(df_r["conversation_id"].unique().tolist())
-    c1,c2,c3=st.columns([2,1,1])
-    with c1: sel=st.selectbox("Conversation",conv_ids,key="flow_conv")
-    with c2: sflt=st.selectbox("Speaker",["All","CUSTOMER","AGENT"],key="flow_spk")
-    with c3: pflt=st.selectbox("Phase",["All","start","middle","end"],key="flow_ph")
-    dv=df_r[df_r["conversation_id"]==sel].copy()
-    if sflt!="All": dv=dv[dv["speaker"]==sflt]
-    if pflt!="All": dv=dv[dv["phase"]==pflt]
-    st.plotly_chart(_chart_tbt_flow(df_r,sel),        width="stretch")
-    st.plotly_chart(_chart_momentum(df_r,sel),         width="stretch")
-    st.plotly_chart(_chart_speaker_heatmap(df_r,sel),  width="stretch")
-    cu=dv[dv["speaker"]=="CUSTOMER"]; ag=dv[dv["speaker"]=="AGENT"]
-    m1,m2,m3,m4=st.columns(4)
-    m1.metric("Turns (filtered)",  len(dv))
-    m2.metric("Customer Avg",  f"{cu['compound'].mean():+.3f}" if not cu.empty else "—")
-    m3.metric("Agent Avg",     f"{ag['compound'].mean():+.3f}" if not ag.empty else "—")
-    m4.metric("Escalation turns", int(dv["potential_escalation"].sum()) if "potential_escalation" in dv.columns else 0)
+    sh("🔄", "Turn-by-Turn Sentiment Flow")
+
+    # ── Cached conversation lists ──────────────────────────────────────────
+    lists = _get_smart_conv_lists(df_r)
+
+    # ── Conversation selector row ──────────────────────────────────────────
+    c_mode, c_search, c_view = st.columns([1.6, 2, 1.2])
+
+    with c_mode:
+        conv_mode = st.selectbox(
+            "Quick filter",
+            ["All conversations",
+             "😡 Worst 20 (lowest customer sentiment)",
+             "😊 Best 20 (highest customer sentiment)",
+             "📏 Longest 20 (most turns)"],
+            key="flow_mode",
+        )
+
+    # Pick pool based on mode
+    pool = {
+        "😡 Worst 20 (lowest customer sentiment)":  lists["worst20"],
+        "😊 Best 20 (highest customer sentiment)":  lists["best20"],
+        "📏 Longest 20 (most turns)":               lists["longest20"],
+    }.get(conv_mode, lists["all_ids"])
+
+    with c_search:
+        search_txt = st.text_input("🔍 Search conversation ID", value="",
+                                   placeholder="e.g. CONV_0042", key="flow_search")
+        if search_txt.strip():
+            pool = [c for c in lists["all_ids"]
+                    if search_txt.strip().upper() in c.upper()] or pool
+
+    with c_view:
+        view_mode = st.radio("View", ["Single", "Compare ×2"],
+                             horizontal=True, key="flow_viewmode")
+
+    # ── Speaker toggle + filters ───────────────────────────────────────────
+    fc1, fc2, fc3 = st.columns([1, 1, 1])
+    with fc1:
+        sel = st.selectbox("Conversation A", pool, key="flow_conv")
+    with fc2:
+        spk_toggle = st.toggle("Split by speaker", value=True, key="flow_spk_toggle")
+    with fc3:
+        pflt = st.selectbox("Phase filter", ["All","start","middle","end"], key="flow_ph")
+
+    sel_b = None
+    if view_mode == "Compare ×2":
+        sel_b = st.selectbox("Conversation B", [c for c in pool if c != sel],
+                             key="flow_conv_b")
+
+    # ── Mini KPI strip for selected conversation ───────────────────────────
+    dv = df_r[df_r["conversation_id"] == sel].copy()
+    if pflt != "All": dv = dv[dv["phase"] == pflt]
+    cu = dv[dv["speaker"] == "CUSTOMER"]
+    ag = dv[dv["speaker"] == "AGENT"]
+    esc_n = int(dv["potential_escalation"].sum()) if "potential_escalation" in dv.columns else 0
+    res_n = int(dv["potential_resolution"].sum()) if "potential_resolution" in dv.columns else 0
+
+    k1,k2,k3,k4,k5 = st.columns(5)
+    k1.metric("Turns",          len(df_r[df_r["conversation_id"]==sel]))
+    k2.metric("Customer Avg",   f"{cu['compound'].mean():+.3f}" if not cu.empty else "—")
+    k3.metric("Agent Avg",      f"{ag['compound'].mean():+.3f}" if not ag.empty else "—")
+    k4.metric("⚠️ Escalations", esc_n,
+              delta="High" if esc_n > 2 else None,
+              delta_color="inverse")
+    k5.metric("✅ Resolutions",  res_n)
+
+    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+
+    # ── Main charts ────────────────────────────────────────────────────────
+    if view_mode == "Compare ×2" and sel_b:
+        sh("⚖️", f"Comparison: {sel} vs {sel_b}")
+        st.plotly_chart(_chart_compare_two(df_r, sel, sel_b), width="stretch")
+
+    else:
+        # ── Tab set: Flow / Replay / Momentum / Heatmap ──
+        tab_flow, tab_replay, tab_mom, tab_heat = st.tabs([
+            "📈 Flow Chart", "▶ Replay", "📊 Momentum", "🌡️ Heatmap"
+        ])
+
+        with tab_flow:
+            st.plotly_chart(
+                _chart_tbt_flow(df_r, sel, show_speaker_lines=spk_toggle),
+                width="stretch",
+            )
+            # ── Export chart as PNG ──────────────────────────────────────
+            try:
+                import plotly.io as pio
+                fig_bytes = pio.to_image(
+                    _chart_tbt_flow(df_r, sel, show_speaker_lines=spk_toggle),
+                    format="png", width=1200, height=500, scale=2,
+                )
+                st.download_button(
+                    "📷 Export chart as PNG",
+                    data=fig_bytes,
+                    file_name=f"flow_{sel}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                    mime="image/png",
+                )
+            except Exception:
+                st.caption("PNG export requires `kaleido` — `pip install kaleido`")
+
+        with tab_replay:
+            st.caption("Press ▶ Play to watch sentiment evolve turn by turn, "
+                       "or drag the slider manually.")
+            st.plotly_chart(_chart_replay_animation(df_r, sel), width="stretch")
+
+        with tab_mom:
+            st.plotly_chart(_chart_momentum(df_r, sel), width="stretch")
+
+        with tab_heat:
+            st.plotly_chart(_chart_speaker_heatmap(df_r, sel), width="stretch")
 
 # ─── Explorer ────────────────────────────────────────────────────────────────
 def page_explorer(df_r):
