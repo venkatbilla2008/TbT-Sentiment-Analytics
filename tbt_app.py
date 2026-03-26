@@ -847,12 +847,17 @@ def _cached_parse(checksum: str, fname: str, dataset_type: str,
     a short string rather than a potentially huge bytes object — preventing
     false cache hits when the internal hash truncates large files.
     """
-    # ── Polars read is 3-5x faster than pandas for large files ──
+    # ── Polars read for CSV (fast); Excel falls back to pandas (no fastexcel needed) ──
     if fname.endswith(".csv"):
         df_raw = pl.read_csv(io.BytesIO(file_bytes), infer_schema_length=0,
                              null_values=["","NA","N/A","null","NULL","None"]).to_pandas()
     else:
-        df_raw = pl.read_excel(io.BytesIO(file_bytes)).to_pandas()
+        # pl.read_excel requires the optional 'fastexcel' package which may not be
+        # installed — use pandas openpyxl engine as a safe universal fallback
+        try:
+            df_raw = pl.read_excel(io.BytesIO(file_bytes)).to_pandas()
+        except Exception:
+            df_raw = pd.read_excel(io.BytesIO(file_bytes))
     proc  = ConversationProcessor(dataset_type=dataset_type)
     df_p  = proc.parse(df_raw)
     df_p.attrs["detected_format"] = proc.detected_format
