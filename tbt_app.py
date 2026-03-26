@@ -1184,18 +1184,22 @@ def _chart_tbt_flow(df, conv_id, show_speaker_lines: bool = True):
         )
 
     return apply_chart(fig.update_layout(
-        title=f"Turn-by-Turn Flow — {conv_id}",
-        title_font_size=14,
-        title_x=0,
-        margin=dict(l=10, r=20, t=70, b=10),   # extra top margin to separate title from legend
+        title=dict(
+            text=f"Turn-by-Turn Flow — {conv_id}",
+            font=dict(size=14),
+            x=0, y=0.98, xanchor="left", yanchor="top",
+        ),
+        margin=dict(l=10, r=20, t=55, b=10),
         xaxis=dict(title="Turn"),
         yaxis=dict(title="Sentiment Score", range=[-1.1, 1.1]),
         legend=dict(
-            orientation="h",
-            yanchor="bottom", y=1.08,           # clear of title
-            xanchor="left",   x=0,
-            bgcolor="rgba(0,0,0,0)",
-            font=dict(size=12),
+            orientation="v",              # vertical list — sits in corner, never near title
+            yanchor="top",   y=0.98,      # top-right inside plot area
+            xanchor="right", x=0.99,
+            bgcolor="rgba(255,255,255,0.7)",
+            bordercolor=C['border'],
+            borderwidth=1,
+            font=dict(size=11),
         ),
     ))
 
@@ -1258,18 +1262,22 @@ def _chart_compare_two(df: pd.DataFrame, conv_a: str, conv_b: str) -> go.Figure:
         ))
 
     return apply_chart(fig.update_layout(
-        title=f"Conversation Comparison — {conv_a} vs {conv_b}",
-        title_font_size=14,
-        title_x=0,
-        margin=dict(l=10, r=20, t=70, b=10),   # extra top margin so title + legend don't collide
+        title=dict(
+            text=f"Conversation Comparison — {conv_a} vs {conv_b}",
+            font=dict(size=14),
+            x=0, y=0.98, xanchor="left", yanchor="top",
+        ),
+        margin=dict(l=10, r=20, t=55, b=10),
         xaxis=dict(title="Turn Position (0=start, 1=end)"),
         yaxis=dict(title="Sentiment Score", range=[-1.1, 1.1]),
         legend=dict(
-            orientation="h",
-            yanchor="bottom", y=1.08,           # sits above plot but below title
-            xanchor="left",   x=0,
-            bgcolor="rgba(0,0,0,0)",
-            font=dict(size=12),
+            orientation="v",              # vertical list inside plot — never overlaps title
+            yanchor="top",   y=0.98,      # top-right corner of plot area
+            xanchor="right", x=0.99,
+            bgcolor="rgba(255,255,255,0.7)",
+            bordercolor=C['border'],
+            borderwidth=1,
+            font=dict(size=11),
         ),
     ))
 
