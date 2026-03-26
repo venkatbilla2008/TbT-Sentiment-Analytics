@@ -152,6 +152,101 @@ CHART_LAYOUT  = dict(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PII REDACTION  — 8 pattern types (ported from TextInsightMiner)
+# ─────────────────────────────────────────────────────────────────────────────
+class PIIRedactor:
+    """
+    Redacts 8 PII pattern types from text using Polars vectorised regex.
+
+    Patterns
+    --------
+    EMAIL  — standard e-mail addresses
+    CARD   — Visa / MC / Amex / Discover credit-card numbers
+    SSN    — US Social-Security Numbers  (###-##-####)
+    MRN    — Medical Record Numbers  (MRN / Patient ID prefix)
+    DOB    — Dates of birth  (MM/DD/YYYY or MM-DD-YYYY)
+    IP     — IPv4 addresses
+    PHONE  — North-American phone numbers (various separators)
+    ADDR   — Street addresses  (number + street type keyword)
+
+    Modes
+    -----
+    token   → [EMAIL]            (type tag only)
+    mask    → [EMAIL:REDACTED]   (type + REDACTED label)
+    remove  → ""                 (blank — PII stripped entirely)
+    """
+
+    PATS: Dict[str, str] = {
+        "EMAIL": r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}",
+        "CARD":  r"\b(?:4\d{12}(?:\d{3})?|5[1-5]\d{14}|3[47]\d{13}|6(?:011|5\d{2})\d{12})\b",
+        "SSN":   r"\b\d{3}-\d{2}-\d{4}\b",
+        "MRN":   r"\b(?:MRN|Medical\s*Record|Patient\s*ID)[:\s#]+[A-Z0-9]{5,12}\b",
+        "DOB":   r"\b(?:0[1-9]|1[0-2])[/\-](?:0[1-9]|[12]\d|3[01])[/\-](?:19|20)\d{2}\b",
+        "IP":    r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b",
+        "PHONE": r"(?:\+?1[\s.\-]?)?\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}\b",
+        "ADDR":  r"\b\d{1,5}\s+[A-Za-z0-9\s,.\-]+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Way|Place|Pl|Circle|Cir|Apt|Suite|Ste|Unit)\b",
+    }
+
+    @classmethod
+    def redact_series(cls, col: pl.Series, mode: str = "mask") -> pl.Series:
+        """
+        Apply all PII patterns to a Polars Series of strings.
+        Returns a new Series with PII replaced according to *mode*.
+        Silently skips any pattern that raises a regex error.
+        """
+        result = col.cast(pl.Utf8).fill_null("")
+        for ptype, pat in cls.PATS.items():
+            if mode == "token":
+                replacement = f"[{ptype}]"
+            elif mode == "remove":
+                replacement = ""
+            else:  # default: "mask"
+                replacement = f"[{ptype}:REDACTED]"
+            try:
+                result = result.str.replace_all(pat, replacement)
+            except Exception:
+                pass  # skip patterns that fail on edge-case data
+        return result
+
+    @classmethod
+    def redact_dataframe(
+        cls,
+        df: pd.DataFrame,
+        columns: List[str],
+        mode: str = "mask",
+    ) -> Tuple[pd.DataFrame, int]:
+        """
+        Redact PII from *columns* in a Pandas DataFrame.
+        Returns (redacted_df, n_rows_with_any_redaction).
+        """
+        df_out = df.copy()
+        redacted_rows: set = set()
+        for col in columns:
+            if col not in df_out.columns:
+                continue
+            original  = pl.Series(df_out[col].astype(str).fillna(""))
+            redacted  = cls.redact_series(original, mode=mode)
+            changed   = (original != redacted).to_numpy()
+            redacted_rows.update(int(i) for i in np.where(changed)[0])
+            df_out[col] = redacted.to_list()
+        return df_out, len(redacted_rows)
+
+    @classmethod
+    def count_pii(cls, series: pd.Series) -> Dict[str, int]:
+        """Return per-type hit counts for an audit badge."""
+        counts: Dict[str, int] = {}
+        col = pl.Series(series.astype(str).fillna(""))
+        for ptype, pat in cls.PATS.items():
+            try:
+                hits = int(col.str.count_matches(pat).sum())
+                if hits > 0:
+                    counts[ptype] = hits
+            except Exception:
+                pass
+        return counts
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SMALL HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 def _score_color(s: float) -> str:
@@ -670,10 +765,12 @@ def _file_checksum(file_bytes: bytes) -> str:
 
 @st.cache_data(show_spinner=False)
 def _cached_parse(checksum: str, fname: str, dataset_type: str,
-                  file_bytes: bytes) -> pd.DataFrame:
+                  file_bytes: bytes,
+                  pii_enabled: bool = False,
+                  pii_mode: str = "mask") -> pd.DataFrame:
     """
     Parse raw bytes → turns DataFrame.
-    Cache key = SHA-256 checksum + filename + domain.
+    Cache key = SHA-256 checksum + filename + domain + PII settings.
     Using checksum (not raw bytes) as first arg guarantees Streamlit hashes
     a short string rather than a potentially huge bytes object — preventing
     false cache hits when the internal hash truncates large files.
@@ -685,6 +782,17 @@ def _cached_parse(checksum: str, fname: str, dataset_type: str,
     proc  = ConversationProcessor(dataset_type=dataset_type)
     df_p  = proc.parse(df_raw)
     df_p.attrs["detected_format"] = proc.detected_format
+
+    # ── PII redaction applied right after parsing, before scoring ──
+    if pii_enabled:
+        redact_cols = [c for c in ("message", "cleaned_message") if c in df_p.columns]
+        df_p, n_redacted = PIIRedactor.redact_dataframe(df_p, redact_cols, mode=pii_mode)
+        df_p.attrs["pii_redacted_rows"] = n_redacted
+        df_p.attrs["pii_mode"]          = pii_mode
+    else:
+        df_p.attrs["pii_redacted_rows"] = 0
+        df_p.attrs["pii_mode"]          = "off"
+
     return df_p
 
 
@@ -714,13 +822,15 @@ def run_pipeline(
     fname: str,
     dataset_type: str,
     progress_bar=None,
+    pii_enabled: bool = False,
+    pii_mode: str = "mask",
 ) -> Tuple[pd.DataFrame, Dict, str]:
     """
     Full pipeline — every stage independently cached.
 
     Cache behaviour
     ---------------
-    _cached_parse    : busted when SHA-256 checksum OR domain changes
+    _cached_parse    : busted when SHA-256 checksum OR domain OR PII settings change
     _cached_score    : busted when parsed DataFrame changes
     _cached_analytics: busted when scored DataFrame changes
     _precompute_aggs : busted when results DataFrame changes
@@ -729,7 +839,8 @@ def run_pipeline(
     checksum = _file_checksum(file_bytes)
 
     if progress_bar: progress_bar.progress(0.10, text="Parsing transcripts…")
-    df_p     = _cached_parse(checksum, fname, dataset_type, file_bytes)
+    df_p     = _cached_parse(checksum, fname, dataset_type, file_bytes,
+                             pii_enabled=pii_enabled, pii_mode=pii_mode)
     detected = df_p.attrs.get("detected_format", "—")
 
     # Safety cap
@@ -744,8 +855,15 @@ def run_pipeline(
     if progress_bar: progress_bar.progress(0.75, text="Computing analytics with Polars…")
     df_r, ins = _cached_analytics(df_s)
 
+    # Carry PII audit metadata forward so the UI can display a badge
+    pii_meta = {
+        "enabled":       pii_enabled,
+        "mode":          pii_mode if pii_enabled else "off",
+        "redacted_rows": df_p.attrs.get("pii_redacted_rows", 0),
+    }
+
     if progress_bar: progress_bar.progress(1.0, text="Done ✓")
-    return df_r, ins, detected
+    return df_r, ins, detected, pii_meta
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1579,6 +1697,35 @@ def render_sidebar():
         dataset_type = domain_keys[sel]
 
         st.markdown("---")
+        st.markdown("### 🛡️ PII Redaction")
+        pii_enabled = st.checkbox(
+            "Enable PII Redaction",
+            value=False,
+            key="sb_pii",
+            help="Scrub emails, phones, SSNs, card numbers, IPs, addresses, DOB & MRNs before analysis.",
+        )
+        pii_mode = "mask"
+        if pii_enabled:
+            pii_mode = st.selectbox(
+                "Redaction Mode",
+                options=["mask", "token", "remove"],
+                format_func=lambda m: {
+                    "mask":   "🔒 Mask  — [EMAIL:REDACTED]",
+                    "token":  "🏷️ Token — [EMAIL]",
+                    "remove": "🗑️ Remove — blank",
+                }[m],
+                key="sb_pii_mode",
+                help="mask = label+REDACTED tag · token = label only · remove = strip entirely",
+            )
+            st.markdown(
+                f'<div style="background:rgba(45,95,110,0.08);border:1px solid {C["teal"]};'
+                f'border-radius:6px;padding:6px 10px;font-size:11px;color:{C["teal"]};margin-top:4px">'
+                f'🛡️ 8 pattern types: EMAIL · PHONE · CARD · SSN · MRN · DOB · IP · ADDR'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("---")
         st.markdown("### 📂 Upload Data")
         uploaded = st.file_uploader("CSV or Excel", type=["csv","xlsx","xls"],
                                     help="Upload conversation transcripts (CSV or Excel).")
@@ -1601,8 +1748,8 @@ def render_sidebar():
                 st.cache_data.clear()
                 gc.collect()
                 current_page = st.session_state.get("page", "📊 Overview")
-                for k in ("df_r","ins","detected","fname",
-                          "_file_checksum","_dataset_type"):
+                for k in ("df_r","ins","detected","fname","pii_meta",
+                          "_file_checksum","_dataset_type","_pii_key"):
                     st.session_state.pop(k, None)
                 # Stay on the current page (not Home)
                 st.session_state["page"] = current_page
@@ -1628,7 +1775,7 @@ def render_sidebar():
             unsafe_allow_html=True,
         )
 
-    return dataset_type, uploaded, run
+    return dataset_type, uploaded, run, pii_enabled, pii_mode
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1949,7 +2096,7 @@ def main():
         return
 
     # ── Inner app pages — sidebar rendered only here ──────────────────────────
-    dataset_type, uploaded, run_clicked = render_sidebar()
+    dataset_type, uploaded, run_clicked, pii_enabled, pii_mode = render_sidebar()
 
     # ── Run pipeline when user clicks ▶ Run Analysis ──────────────────────────
     if uploaded is not None and run_clicked:
@@ -1957,29 +2104,30 @@ def main():
             file_bytes = uploaded.read()
             checksum   = _file_checksum(file_bytes)
 
-            # ── Bust stale session results whenever file or domain changes ──
-            # This is the second line of defence (first is the SHA-256 cache key).
-            # If the user uploads a *different* file with the same name the
-            # session_state would still hold the old df_r/ins — wipe them first.
+            # ── Bust stale session results whenever file, domain, or PII settings change ──
             prev_checksum = st.session_state.get("_file_checksum")
             prev_domain   = st.session_state.get("_dataset_type")
-            if checksum != prev_checksum or dataset_type != prev_domain:
-                for k in ("df_r", "ins", "detected", "fname"):
+            prev_pii      = st.session_state.get("_pii_key")
+            pii_key       = f"{pii_enabled}_{pii_mode}"
+            if checksum != prev_checksum or dataset_type != prev_domain or pii_key != prev_pii:
+                for k in ("df_r", "ins", "detected", "fname", "pii_meta"):
                     st.session_state.pop(k, None)
-                # Also clear all @st.cache_data caches so nothing is stale
                 st.cache_data.clear()
 
             pb = st.progress(0, text="Starting pipeline…")
             try:
-                df_r, ins, detected = run_pipeline(
-                    file_bytes, uploaded.name, dataset_type, progress_bar=pb
+                df_r, ins, detected, pii_meta = run_pipeline(
+                    file_bytes, uploaded.name, dataset_type, progress_bar=pb,
+                    pii_enabled=pii_enabled, pii_mode=pii_mode,
                 )
                 pb.empty()
                 st.session_state.update({
                     "df_r": df_r, "ins": ins,
                     "detected": detected, "fname": uploaded.name,
+                    "pii_meta": pii_meta,
                     "_file_checksum": checksum,
                     "_dataset_type":  dataset_type,
+                    "_pii_key":       pii_key,
                 })
                 if st.session_state.get("page") in ("🏠 Home", "📊 Overview"):
                     st.session_state["page"] = "📊 Overview"
@@ -2005,14 +2153,26 @@ def main():
     ins      = st.session_state["ins"]
     detected = st.session_state.get("detected", "—")
     fname    = st.session_state.get("fname", "")
+    pii_meta = st.session_state.get("pii_meta", {"enabled": False, "mode": "off", "redacted_rows": 0})
 
     # Status bar
-    ca, _, cc = st.columns([3, 2, 1])
+    ca, cb_col, cc = st.columns([3, 2, 1])
     with ca:
+        pii_badge = ""
+        if pii_meta.get("enabled"):
+            n_r  = pii_meta.get("redacted_rows", 0)
+            mode = pii_meta.get("mode", "mask")
+            pii_badge = (
+                f' &nbsp;·&nbsp; <span style="background:rgba(45,95,110,0.12);'
+                f'border:1px solid {C["teal"]};border-radius:4px;padding:1px 7px;'
+                f'font-size:11px;color:{C["teal"]};font-weight:600">'
+                f'🛡️ PII {mode} · {n_r:,} rows redacted</span>'
+            )
         st.markdown(
             f'<div style="color:{C["muted"]};font-size:.82rem">'
             f'📂 {fname} &nbsp;·&nbsp; '
-            f'Format: <strong style="color:{C["teal"]}">{detected}</strong></div>',
+            f'Format: <strong style="color:{C["teal"]}">{detected}</strong>'
+            f'{pii_badge}</div>',
             unsafe_allow_html=True,
         )
     with cc:
