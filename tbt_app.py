@@ -326,8 +326,8 @@ class ConversationProcessor:
         col = self._find_col(df)
         if not col: raise ValueError("No transcript column found. Expected: Conversation, Transcripts, Comments, message, chat, etc.")
         if self.dataset_type == "auto":
-            sample = str(df[col].dropna().iloc[0]) if len(df) > 0 else ""
-            self.dataset_type = self._detect(sample, col)
+            # Use multi-row voting for robust detection (not just first row)
+            self.dataset_type = self._detect_from_df(df, col)
         rows: List[Dict] = []
         for idx, row in df.iterrows():
             text = str(row[col])
@@ -344,14 +344,32 @@ class ConversationProcessor:
     def detected_format(self) -> str:
         return FORMAT_LABELS.get(self.dataset_type, self.dataset_type.upper())
 
-    def _detect(self, s, col):
+    def _detect_format(self, s: str) -> str:
+        """Detect format from a single text sample. Priority order is
+        most-specific first so generic patterns never shadow specific ones."""
         if self._pb.search(s):  return "netflix"
         if self._pt.search(s):  return "spotify"
         if self._pph.search(s): return "ppt"
         if self._ph.search(s):  return "humana"
         if self._pps.search(s): return "ppt"
-        # Default: treat unknown structured text as ppt (chat/SMS style)
         return "ppt"
+
+    def _detect_from_df(self, df: pd.DataFrame, col: str) -> str:
+        """Vote across up to 10 spread samples for robust format detection."""
+        non_null = df[col].dropna()
+        n = min(10, len(non_null))
+        if n == 0: return "ppt"
+        indices = np.linspace(0, len(non_null) - 1, n, dtype=int)
+        votes: Dict[str, int] = {}
+        for i in indices:
+            fmt = self._detect_format(str(non_null.iloc[i]))
+            votes[fmt] = votes.get(fmt, 0) + 1
+        priority = ["netflix", "spotify", "humana", "ppt"]
+        return max(priority, key=lambda f: (votes.get(f, 0), -priority.index(f)))
+
+    def _detect(self, s, col):
+        """Back-compat wrapper — delegates to _detect_format."""
+        return self._detect_format(s)
 
     def _dispatch(self, text, idx):
         if self.dataset_type == "netflix":  return self._parse_bracket(text, idx)
@@ -1691,10 +1709,21 @@ def render_sidebar():
         st.markdown("### ⚙️ Configuration")
         domain_keys   = list(FORMAT_LABELS.keys())
         domain_labels = [FORMAT_LABELS[k] for k in domain_keys]
+
+        # After a successful run, sync the selectbox to the auto-detected format
+        # so the user always sees what was actually used, not just "Auto-Detect".
+        detected_key = st.session_state.get("detected_domain_key", "auto")
+        default_idx  = domain_keys.index(detected_key) if detected_key in domain_keys else 0
+
         sel = st.selectbox("Domain / Format", options=range(len(domain_keys)),
-                           format_func=lambda i: domain_labels[i], index=0,
-                           help="Select transcript format or leave as Auto-Detect.")
+                           format_func=lambda i: domain_labels[i], index=default_idx,
+                           key="sb_domain",
+                           help="Auto-Detect picks the right format automatically. Override only if needed.")
         dataset_type = domain_keys[sel]
+
+        # If user manually changes the selector, clear the auto-sync so it stays on their choice
+        if sel != default_idx:
+            st.session_state["detected_domain_key"] = domain_keys[sel]
 
         st.markdown("---")
         st.markdown("### 🛡️ PII Redaction")
@@ -1749,7 +1778,7 @@ def render_sidebar():
                 gc.collect()
                 current_page = st.session_state.get("page", "📊 Overview")
                 for k in ("df_r","ins","detected","fname","pii_meta",
-                          "_file_checksum","_dataset_type","_pii_key"):
+                          "_file_checksum","_dataset_type","_pii_key","detected_domain_key"):
                     st.session_state.pop(k, None)
                 # Stay on the current page (not Home)
                 st.session_state["page"] = current_page
@@ -2121,13 +2150,19 @@ def main():
                     pii_enabled=pii_enabled, pii_mode=pii_mode,
                 )
                 pb.empty()
+                # Map the human-readable detected label back to a domain key
+                # so the sidebar selectbox can sync to it automatically.
+                _detected_key = next(
+                    (k for k, v in FORMAT_LABELS.items() if v == detected), "auto"
+                )
                 st.session_state.update({
                     "df_r": df_r, "ins": ins,
                     "detected": detected, "fname": uploaded.name,
                     "pii_meta": pii_meta,
-                    "_file_checksum": checksum,
-                    "_dataset_type":  dataset_type,
-                    "_pii_key":       pii_key,
+                    "_file_checksum":    checksum,
+                    "_dataset_type":     dataset_type,
+                    "_pii_key":          pii_key,
+                    "detected_domain_key": _detected_key,
                 })
                 if st.session_state.get("page") in ("🏠 Home", "📊 Overview"):
                     st.session_state["page"] = "📊 Overview"
