@@ -320,7 +320,12 @@ class ConversationProcessor:
         self._pb  = re.compile(r"^\[(\d{1,2}:\d{2}:\d{2})\s+(AGENT|CUSTOMER|CONSUMER|ADVISOR|SUPPORT)\]:\s*(.*)$", re.I)
         self._ph  = re.compile(r"\[(\d{1,3}:\d{2})\]\s+([^:]+?):\s*([^\[]+?)(?=\[|$)", re.I|re.DOTALL)
         self._pph = re.compile(r"<b>(\d{2}:\d{2}:\d{2})\s+([^:]+?)\s*:\s*</b>([^<]+?)(?:<br\s*/?>|$)", re.I|re.DOTALL)
-        self._pps = re.compile(r"(\d{2}:\d{2}:\d{2})\s+([^:]+?)\s*:\s*(.+?)(?=\d{2}:\d{2}:\d{2}\s+|$)", re.DOTALL)
+        self._pps = re.compile(
+            r"(?<!\d{4}-\d{2}-\d{2} )"   # NOT preceded by ISO date (avoids stealing Spotify rows)
+            r"(\d{2}:\d{2}:\d{2})"        # HH:MM:SS timestamp
+            r"\s+([^:]+?)\s*:\s*(.+?)(?=\d{2}:\d{2}:\d{2}\s+|$)",
+            re.DOTALL
+        )
 
     def parse(self, df: pd.DataFrame) -> pd.DataFrame:
         col = self._find_col(df)
@@ -422,7 +427,8 @@ class ConversationProcessor:
                 msg=" ".join(cm).strip()
                 if msg: turns.append(self._row(idx,tn,ct,self._norm(cs),msg)); tn+=1
         for line in lines:
-            ls=line.strip(); m=self._pt.match(ls)
+            ls=line.strip().lstrip("|").strip()  # strip leading pipe used by some Spotify exports
+            m=self._pt.search(ls)                # search() handles (?:^|\n) anchor in pattern
             if m:
                 flush(); ct,cs=m.group(1),m.group(2); cm=[m.group(3).strip()] if m.group(3).strip() else []
             elif cs and ls: cm.append(ls)
@@ -1180,10 +1186,17 @@ def _chart_tbt_flow(df, conv_id, show_speaker_lines: bool = True):
     return apply_chart(fig.update_layout(
         title=f"Turn-by-Turn Flow — {conv_id}",
         title_font_size=14,
+        title_x=0,
+        margin=dict(l=10, r=20, t=70, b=10),   # extra top margin to separate title from legend
         xaxis=dict(title="Turn"),
         yaxis=dict(title="Sentiment Score", range=[-1.1, 1.1]),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                    xanchor="right", x=1),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom", y=1.08,           # clear of title
+            xanchor="left",   x=0,
+            bgcolor="rgba(0,0,0,0)",
+            font=dict(size=12),
+        ),
     ))
 
 def _chart_momentum(df, conv_id):
@@ -1247,9 +1260,17 @@ def _chart_compare_two(df: pd.DataFrame, conv_a: str, conv_b: str) -> go.Figure:
     return apply_chart(fig.update_layout(
         title=f"Conversation Comparison — {conv_a} vs {conv_b}",
         title_font_size=14,
+        title_x=0,
+        margin=dict(l=10, r=20, t=70, b=10),   # extra top margin so title + legend don't collide
         xaxis=dict(title="Turn Position (0=start, 1=end)"),
         yaxis=dict(title="Sentiment Score", range=[-1.1, 1.1]),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom", y=1.08,           # sits above plot but below title
+            xanchor="left",   x=0,
+            bgcolor="rgba(0,0,0,0)",
+            font=dict(size=12),
+        ),
     ))
 
 
