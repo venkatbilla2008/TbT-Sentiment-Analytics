@@ -137,9 +137,9 @@ FORMAT_LABELS: Dict[str, str] = {
     "hilton":  "🏨 Travel  (Guest feedback)",
 }
 PHASE_ICONS   = {"start": "🚀", "middle": "🔄", "end": "🏁"}
-MAX_TURNS     = 50_000   # hard safety cap
-CHART_SAMPLE  = 2_000    # max points sent to browser for scatter/sunburst
-VADER_WORKERS = 4        # threads for parallel VADER scoring
+MAX_TURNS     = 500_000   # hard safety cap
+CHART_SAMPLE  = 25_000    # max points sent to browser for scatter/sunburst
+VADER_WORKERS = 8        # threads for parallel VADER scoring
 CHART_LAYOUT  = dict(
     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
     font=dict(color=C['text'], family="DM Sans"),
