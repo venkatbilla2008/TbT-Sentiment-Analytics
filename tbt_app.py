@@ -1,17 +1,23 @@
 """
-tbt_app.py  —  Domain Agnostic Turn-by-Turn Sentiment Analytics  v5.0
+tbt_app.py  —  Conversation Turn-by-Turn Sentiment Analytics  v5.1
 ======================================================================
-Performance upgrades in v5.0
-  ✓ Parallel VADER  — ThreadPoolExecutor(4 workers), each thread owns
-                       its own SentimentIntensityAnalyzer; ~2-4× faster scoring
-  ✓ @st.cache_data on ALL 5 pipeline stages (parse / score / analytics /
-                       aggs / excel) — zero recompute on any UI interaction
-  ✓ Polars everywhere — all groupbys, joins, sort, aggregations in AnalyticsEngine
-                        and _precompute_aggs use Polars lazy frames
-  ✓ Vectorised label assignment — numpy np.where over full arrays, no Python loop
-  ✓ Scatter / sunburst subsampled to ≤2 000 points — browser never lags
-  ✓ Paginated data table — 200 rows per page, number_input page control
-  ✓ No numba / JIT / cornerradius dependencies
+Supported transcript formats (conversation-based only)
+  ✓ netflix  — Bracket [HH:MM:SS SPEAKER]: transcripts
+  ✓ spotify  — ISO-timestamp Speaker: transcripts
+  ✓ humana   — Call-centre [MM:SS] Speaker: transcripts
+  ✓ ppt      — HTML <b>HH:MM:SS name:</b> or SMS chat logs
+
+Removed in v5.1
+  ✗ lyft  (customer verbatim / single-turn feedback) — not conversation-based
+  ✗ hilton (guest feedback / single-turn feedback)   — not conversation-based
+
+Performance
+  ✓ Parallel VADER  — ThreadPoolExecutor(4 workers)
+  ✓ @st.cache_data on ALL 5 pipeline stages
+  ✓ Polars everywhere — all groupbys / aggregations
+  ✓ Vectorised label assignment — numpy np.where
+  ✓ Scatter / sunburst subsampled ≤2 000 points
+  ✓ Paginated data table — 200 rows per page
 
 Run:  streamlit run tbt_app.py
 """
@@ -133,8 +139,6 @@ FORMAT_LABELS: Dict[str, str] = {
     "spotify": "🎵 Media / Entertainment  (Timestamp)",
     "humana":  "🏥 Healthcare A  (Call transcript [MM:SS])",
     "ppt":     "🩼 Healthcare B  (Chat / SMS)",
-    "lyft":    "🚗 Transportation  (Customer verbatim)",
-    "hilton":  "🏨 Travel  (Guest feedback)",
 }
 PHASE_ICONS   = {"start": "🚀", "middle": "🔄", "end": "🏁"}
 MAX_TURNS     = 500_000   # hard safety cap
@@ -211,11 +215,9 @@ class ConversationProcessor:
     _PRIO = [
         "Comments","comments","COMMENTS",
         "Conversation","conversation","CONVERSATION",
-        "Additional Feedback","additional feedback","Additional_Feedback",
-        "verbatim","Verbatim","VERBATIM",
         "transcripts","transcript","Transcripts","Transcript",
         "messages","message","Message Text (Translate/Original)",
-        "feedback","Feedback","comment","Comment","text","chat",
+        "text","chat",
     ]
     def __init__(self, dataset_type: str = "auto"):
         self.dataset_type = dataset_type.lower()
@@ -227,7 +229,7 @@ class ConversationProcessor:
 
     def parse(self, df: pd.DataFrame) -> pd.DataFrame:
         col = self._find_col(df)
-        if not col: raise ValueError("No transcript/feedback column found.")
+        if not col: raise ValueError("No transcript column found. Expected: Conversation, Transcripts, Comments, message, chat, etc.")
         if self.dataset_type == "auto":
             sample = str(df[col].dropna().iloc[0]) if len(df) > 0 else ""
             self.dataset_type = self._detect(sample, col)
@@ -253,14 +255,13 @@ class ConversationProcessor:
         if self._pph.search(s): return "ppt"
         if self._ph.search(s):  return "humana"
         if self._pps.search(s): return "ppt"
-        cl = col.lower()
-        return "hilton" if ("additional" in cl or "hilton" in cl) else "lyft"
+        # Default: treat unknown structured text as ppt (chat/SMS style)
+        return "ppt"
 
     def _dispatch(self, text, idx):
-        if self.dataset_type == "netflix":          return self._parse_bracket(text, idx)
-        if self.dataset_type == "humana":           return self._parse_humana(text, idx)
-        if self.dataset_type == "ppt":              return self._parse_ppt(text, idx)
-        if self.dataset_type in ("lyft","hilton"):  return self._parse_feedback(text, idx)
+        if self.dataset_type == "netflix":  return self._parse_bracket(text, idx)
+        if self.dataset_type == "humana":   return self._parse_humana(text, idx)
+        if self.dataset_type == "ppt":      return self._parse_ppt(text, idx)
         return self._parse_spotify(text, idx)
 
     def _find_col(self, df):
@@ -359,9 +360,6 @@ class ConversationProcessor:
             for s in ordered: roles[s]="CUSTOMER" if s==cust else "AGENT"
         all_m=sorted([(ts,s,m) for s in ordered for ts,m in spk_msgs[s]],key=lambda x:x[0])
         return [self._row(idx,i,ts,roles.get(s,"CUSTOMER"),m) for i,(ts,s,m) in enumerate(all_m,1)]
-
-    def _parse_feedback(self, text, idx):
-        m=text.strip(); return [self._row(idx,1,None,"CUSTOMER",m)] if m else []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1365,7 +1363,7 @@ header[data-testid="stHeader"],footer,.stDeployButton,section[data-testid="stSid
 <div class="lp-hero">
 <div class="lp-grd"></div><div class="lp-o1"></div><div class="lp-o2"></div><div class="lp-o3"></div>
 
-<div class="lp-bdg">DOMAIN AGNOSTIC · TURN-BY-TURN ANALYTICS</div>
+<div class="lp-bdg">CONVERSATION TRANSCRIPT ANALYTICS</div>
 <h1 class="lp-ttl">TbT Sentiment Analytics</h1>
 <p class="lp-sub">&nbsp;</p>
 <p class="lp-dsc">Transform raw conversation transcripts into granular sentiment intelligence. Phase-level CSAT/DSAT, escalation detection, and executive narratives — powered by Polars and parallel VADER scoring.</p>
@@ -1398,7 +1396,7 @@ header[data-testid="stHeader"],footer,.stDeployButton,section[data-testid="stSid
 
 <!-- Stats -->
 <div class="lp-sts">
-<div class="lp-st"><div class="lp-sn">6<span>+</span></div><div class="lp-sl">Domain Formats</div></div>
+<div class="lp-st"><div class="lp-sn">4<span>+</span></div><div class="lp-sl">Transcript Formats</div></div>
 <div class="lp-st"><div class="lp-sn">50<span>K</span></div><div class="lp-sl">Turns Supported</div></div>
 <div class="lp-st"><div class="lp-sn">4</div><div class="lp-sl">Parallel Threads</div></div>
 <div class="lp-st"><div class="lp-sn">5</div><div class="lp-sl">Cached Stages</div></div>
@@ -1476,7 +1474,7 @@ header[data-testid="stHeader"],footer,.stDeployButton,section[data-testid="stSid
 <div class="lp-stp">
   <div class="lp-snm">1</div>
   <h4>Upload</h4>
-  <p>CSV or Excel with conversation transcripts or feedback. Auto-detects format across 6 domain types.</p>
+  <p>CSV or Excel with conversation transcripts. Auto-detects format across 4 transcript types — bracket, timestamp, call-centre, and chat/SMS.</p>
 </div>
 <div class="lp-conn"><div class="lp-dot"></div></div>
 <div class="lp-stp">
@@ -1502,7 +1500,7 @@ header[data-testid="stHeader"],footer,.stDeployButton,section[data-testid="stSid
 <tr><td>Scoring Speed</td><td>Hours per dataset</td><td>Seconds — parallel VADER</td></tr>
 <tr><td>Phase Analysis</td><td>Not possible</td><td>Start / Middle / End CSAT & DSAT</td></tr>
 <tr><td>Escalation Detection</td><td>Manual review</td><td>Auto-flagged every turn</td></tr>
-<tr><td>Domain Support</td><td>One format</td><td>6 formats, auto-detected</td></tr>
+<tr><td>Domain Support</td><td>One format</td><td>4 transcript formats, auto-detected</td></tr>
 <tr><td>Visualisations</td><td>Basic charts</td><td>Flow, Waterfall, Sunburst, Heatmap</td></tr>
 <tr><td>Executive Summary</td><td>Written manually</td><td>Auto-generated with recommendations</td></tr>
 <tr><td>Recompute on filter</td><td>Always</td><td>Never — 5-stage cache</td></tr>
@@ -1581,7 +1579,7 @@ def render_sidebar():
         st.markdown("---")
         st.markdown("### 📂 Upload Data")
         uploaded = st.file_uploader("CSV or Excel", type=["csv","xlsx","xls"],
-                                    help="Conversation transcripts or customer feedback.")
+                                    help="Upload conversation transcripts (CSV or Excel).")
         if uploaded:
             st.markdown(f"""
 <div style="background:rgba(45,95,110,0.1);border:1px solid {C['teal']};
