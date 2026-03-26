@@ -886,7 +886,9 @@ def _chart_phase_comparison(ins):
     ])
     return apply_chart(fig.update_layout(barmode="group",title="CSAT vs DSAT by Phase",
         title_font_size=14,yaxis=dict(title="% Customer Turns"),
-        legend=dict(orientation="h",yanchor="bottom",y=1.02)))
+        margin=dict(l=10,r=20,t=60,b=10),
+        legend=dict(orientation="h",yanchor="top",y=1.0,xanchor="right",x=1,
+                    bgcolor="rgba(0,0,0,0)")))
 
 def _chart_sentiment_progression(aggs):
     tp=aggs["turn_prog"]
@@ -1597,10 +1599,13 @@ def render_sidebar():
             if st.button("🗑️ Clear & Reset", key="clear_btn", type="secondary"):
                 # Wipe all cached data and session results
                 st.cache_data.clear()
+                gc.collect()
+                current_page = st.session_state.get("page", "📊 Overview")
                 for k in ("df_r","ins","detected","fname",
                           "_file_checksum","_dataset_type"):
                     st.session_state.pop(k, None)
-                st.session_state["page"] = "🏠 Home"
+                # Stay on the current page (not Home)
+                st.session_state["page"] = current_page
                 st.rerun()
 
             # Show active file + record count as a sanity check
@@ -1722,12 +1727,8 @@ def page_overview(df_r, ins):
     with c4: st.plotly_chart(_chart_escalation_resolution(aggs),    width="stretch")
     sh("🌐","Conversation Sunburst")
     st.plotly_chart(_chart_sunburst(aggs), width="stretch")
-    sh("📉","Sentiment Progression & Conversation Map")
+    sh("📉","Sentiment Progression")
     st.plotly_chart(_chart_sentiment_progression(aggs), width="stretch")
-    st.plotly_chart(_chart_conv_scatter(aggs),          width="stretch")
-    esc_fig=_chart_escalation_timeline(aggs)
-    if esc_fig:
-        sh("⚡","Escalation Event Timeline"); st.plotly_chart(esc_fig, width="stretch")
 
 # ─── TbT Flow ────────────────────────────────────────────────────────────────
 def page_tbt_flow(df_r):
