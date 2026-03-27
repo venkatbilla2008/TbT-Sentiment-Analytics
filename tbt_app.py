@@ -968,7 +968,10 @@ def run_pipeline(
             f"Out of memory while parsing '{fname}'. "
             "Try splitting the file into smaller batches (≤ 5,000 rows each)."
         )
-    detected = df_p.attrs.get("detected_format", "—")
+    # ── Extract all attrs from df_p NOW before it is ever deleted ───────────
+    detected        = df_p.attrs.get("detected_format", "—")
+    _pii_redacted   = df_p.attrs.get("pii_redacted_rows", 0)
+    _pii_mode_used  = df_p.attrs.get("pii_mode", "off")
 
     # ── Hard cap: enforce MAX_TURNS before any heavy computation ─────────────
     n_raw = len(df_p)
@@ -992,7 +995,7 @@ def run_pipeline(
     if progress_bar: progress_bar.progress(0.35, text=f"Scoring {n_turns:,} turns in {max(1, n_turns//CHUNK_TURNS)} batch(es)…")
     try:
         df_s = _cached_score(df_p)
-        del df_p          # release parsed frame — scored frame is all we need now
+        del df_p          # safe to delete — all attrs already extracted above
         gc.collect()
     except MemoryError:
         gc.collect()
@@ -1015,11 +1018,11 @@ def run_pipeline(
             "Try reducing the dataset size or restarting the app."
         )
 
-    # Carry PII audit metadata forward so the UI can display a badge
+    # Carry PII audit metadata forward — uses pre-extracted values, not df_p
     pii_meta = {
         "enabled":       pii_enabled,
-        "mode":          pii_mode if pii_enabled else "off",
-        "redacted_rows": df_p.attrs.get("pii_redacted_rows", 0),
+        "mode":          _pii_mode_used if pii_enabled else "off",
+        "redacted_rows": _pii_redacted,
     }
 
     if progress_bar: progress_bar.progress(1.0, text="Done ✓")
