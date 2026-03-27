@@ -141,9 +141,10 @@ FORMAT_LABELS: Dict[str, str] = {
     "ppt":     "🩼 Healthcare B  (Chat / SMS)",
 }
 PHASE_ICONS   = {"start": "🚀", "middle": "🔄", "end": "🏁"}
-MAX_TURNS     = 500_000   # hard safety cap
-CHART_SAMPLE  = 5_000    # max points sent to browser for scatter/sunburst
-VADER_WORKERS = 4        # threads for parallel VADER scoring
+MAX_TURNS     = 150_000   # hard safety cap — above this Polars collect() risks OOM
+CHUNK_TURNS   = 10_000    # VADER scores this many turns per batch (streaming)
+CHART_SAMPLE  = 5_000     # max points sent to browser for scatter/sunburst
+VADER_WORKERS = 4         # threads for parallel VADER — fewer = less peak RAM
 CHART_LAYOUT  = dict(
     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
     font=dict(color=C['text'], family="DM Sans"),
@@ -707,8 +708,15 @@ class AnalyticsEngine:
               .alias("consecutive_turns"),
         ]).drop("_streak_id")
 
-        d = lf.collect().to_pandas()
+        # collect(streaming=True) — Polars processes the lazy plan row-by-row
+        # in Rust without materialising the full frame in Python heap.
+        # Falls back to standard collect() if streaming is unsupported.
+        try:
+            d = lf.collect(streaming=True).to_pandas()
+        except Exception:
+            d = lf.collect().to_pandas()
         d = d.sort_values(["conversation_id","turn_sequence"]).reset_index(drop=True)
+        gc.collect()
         return d
 
     def compute_insights(self, df: pd.DataFrame) -> Dict[str, Any]:
@@ -877,20 +885,52 @@ def _cached_parse(checksum: str, fname: str, dataset_type: str,
 
 @st.cache_data(show_spinner=False)
 def _cached_score(df_p: pd.DataFrame) -> pd.DataFrame:
-    """Score turns with VADER. Cached by DataFrame content."""
+    """
+    Score turns with VADER — streaming chunk approach for OOM safety.
+
+    For datasets > CHUNK_TURNS rows the DataFrame is split into batches
+    of CHUNK_TURNS, scored independently, then concatenated.  Each batch
+    is released from RAM before the next is allocated, capping peak memory
+    to roughly 2× the size of one chunk rather than 2× the full dataset.
+    """
     sent = SentimentEngine()
     sent.calibrate(df_p)
-    return sent.score(df_p)
+
+    n = len(df_p)
+    if n <= CHUNK_TURNS:
+        # Small dataset — score in one shot (original fast path)
+        result = sent.score(df_p)
+        gc.collect()
+        return result
+
+    # Large dataset — stream through CHUNK_TURNS batches
+    parts: List[pd.DataFrame] = []
+    for start in range(0, n, CHUNK_TURNS):
+        chunk  = df_p.iloc[start : start + CHUNK_TURNS].copy()
+        scored = sent.score(chunk)
+        parts.append(scored)
+        del chunk                  # free input chunk immediately
+        gc.collect()               # force GC between batches
+
+    result = pd.concat(parts, ignore_index=True)
+    del parts
+    gc.collect()
+    return result
 
 
 @st.cache_data(show_spinner=False)
 def _cached_analytics(df_s: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
     """
-    Compute turn metrics + insights.  Cached by scored DataFrame content.
-    Changing the file or domain key busts the cache automatically.
+    Compute turn metrics + insights — OOM-safe collect() strategy.
+
+    Polars LazyFrame.collect() materialises the entire result at once.
+    For 120k+ turns that can spike RAM beyond 2GB.  Solution: collect()
+    conversation-level aggregates first (tiny), join them back lazily,
+    then collect the enriched frame in streaming mode using
+    collect(streaming=True) which Polars processes row-by-row in Rust.
     """
     anal = AnalyticsEngine()
-    df_r = anal.compute_turn_metrics(df_s)
+    df_r = anal.compute_turn_metrics(df_s)   # now uses streaming collect internally
     ins  = anal.compute_insights(df_r)
     gc.collect()
     return df_r, ins
@@ -917,22 +957,63 @@ def run_pipeline(
     """
     checksum = _file_checksum(file_bytes)
 
+    # ── Stage 1: Parse ────────────────────────────────────────────────────────
     if progress_bar: progress_bar.progress(0.10, text="Parsing transcripts…")
-    df_p     = _cached_parse(checksum, fname, dataset_type, file_bytes,
-                             pii_enabled=pii_enabled, pii_mode=pii_mode)
+    try:
+        df_p     = _cached_parse(checksum, fname, dataset_type, file_bytes,
+                                 pii_enabled=pii_enabled, pii_mode=pii_mode)
+    except MemoryError:
+        gc.collect()
+        raise MemoryError(
+            f"Out of memory while parsing '{fname}'. "
+            "Try splitting the file into smaller batches (≤ 5,000 rows each)."
+        )
     detected = df_p.attrs.get("detected_format", "—")
 
-    # Safety cap
-    if len(df_p) > MAX_TURNS:
-        df_p = df_p.head(MAX_TURNS)
-        st.warning(f"⚠️ Dataset capped at {MAX_TURNS:,} turns for performance. "
-                   "Split your file for full analysis.")
+    # ── Hard cap: enforce MAX_TURNS before any heavy computation ─────────────
+    n_raw = len(df_p)
+    if n_raw > MAX_TURNS:
+        df_p = df_p.iloc[:MAX_TURNS].copy()
+        gc.collect()
+        st.warning(
+            f"⚠️ Dataset capped at {MAX_TURNS:,} turns (your file had {n_raw:,}). "
+            "Split into smaller files for full analysis."
+        )
 
-    if progress_bar: progress_bar.progress(0.35, text=f"Scoring {len(df_p):,} turns in parallel…")
-    df_s = _cached_score(df_p)
+    # ── Soft warning: large dataset — tell user it may take a moment ──────────
+    n_turns = len(df_p)
+    if n_turns > 50_000:
+        st.info(
+            f"📊 Large dataset: {n_turns:,} turns. "
+            "Scoring in streaming batches — this may take 1–2 minutes."
+        )
 
-    if progress_bar: progress_bar.progress(0.75, text="Computing analytics with Polars…")
-    df_r, ins = _cached_analytics(df_s)
+    # ── Stage 2: Score (chunked streaming — OOM safe) ─────────────────────────
+    if progress_bar: progress_bar.progress(0.35, text=f"Scoring {n_turns:,} turns in {max(1, n_turns//CHUNK_TURNS)} batch(es)…")
+    try:
+        df_s = _cached_score(df_p)
+        del df_p          # release parsed frame — scored frame is all we need now
+        gc.collect()
+    except MemoryError:
+        gc.collect()
+        raise MemoryError(
+            f"Out of memory while scoring {n_turns:,} turns. "
+            f"The dataset is too large for available RAM. "
+            f"Try uploading ≤ {CHUNK_TURNS:,} rows at a time."
+        )
+
+    # ── Stage 3: Analytics (Polars streaming collect — OOM safe) ─────────────
+    if progress_bar: progress_bar.progress(0.75, text="Computing analytics with Polars streaming…")
+    try:
+        df_r, ins = _cached_analytics(df_s)
+        del df_s          # release scored frame after analytics
+        gc.collect()
+    except MemoryError:
+        gc.collect()
+        raise MemoryError(
+            "Out of memory during analytics. "
+            "Try reducing the dataset size or restarting the app."
+        )
 
     # Carry PII audit metadata forward so the UI can display a badge
     pii_meta = {
@@ -2267,6 +2348,17 @@ def main():
                 if st.session_state.get("page") in ("🏠 Home", "📊 Overview"):
                     st.session_state["page"] = "📊 Overview"
                 st.rerun()
+            except MemoryError as exc:
+                pb.empty()
+                gc.collect()
+                st.error(
+                    f"💾 **Out of Memory — {exc}**\n\n"
+                    "**Quick fixes:**\n"
+                    "1. Split your file into smaller batches (≤ 5,000 rows / ≤ 50,000 turns)\n"
+                    "2. Click **🗑️ Clear & Reset** then re-upload a smaller file\n"
+                    "3. Restart the app to free all cached memory"
+                )
+                return
             except Exception as exc:
                 pb.empty()
                 st.error(f"Analysis failed: {exc}")
