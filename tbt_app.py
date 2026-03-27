@@ -141,16 +141,34 @@ FORMAT_LABELS: Dict[str, str] = {
     "ppt":     "🩼 Healthcare B  (Chat / SMS)",
 }
 PHASE_ICONS   = {"start": "🚀", "middle": "🔄", "end": "🏁"}
-MAX_TURNS     = 150_000   # hard safety cap — above this Polars collect() risks OOM
-CHUNK_TURNS   = 10_000    # VADER scores this many turns per batch (streaming)
+MAX_TURNS     = 100_000   # hard safety cap — 100k turns fits in 1GB Cloud RAM
+CHUNK_TURNS   = 5_000     # VADER batch size — 5k rows ≈ 50MB peak per batch
 CHART_SAMPLE  = 5_000     # max points sent to browser for scatter/sunburst
-VADER_WORKERS = 4         # threads for parallel VADER — fewer = less peak RAM
+VADER_WORKERS = 2         # 2 threads on Cloud (1GB RAM); increase locally if RAM allows
 CHART_LAYOUT  = dict(
     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
     font=dict(color=C['text'], family="DM Sans"),
     margin=dict(l=10, r=20, t=40, b=10),
     hoverlabel=dict(bgcolor=C['text'], font_size=12, font_color=C['warm_l']),
 )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POLARS HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def _safe_collect(lf: pl.LazyFrame) -> pl.DataFrame:
+    """Version-safe Polars collect — tries streaming engine first (lower RAM),
+    falls back to standard collect() on API mismatch or unsupported plan.
+    Polars changed streaming API: <1.25 uses streaming=True, >=1.25 uses engine='streaming'.
+    Window functions (over()) may not be supported in streaming mode — fallback handles this."""
+    _ver = tuple(int(x) for x in pl.__version__.split('.')[:2])
+    try:
+        if _ver >= (1, 25):
+            return lf.collect(engine='streaming')
+        else:
+            return lf.collect(streaming=True)
+    except Exception:
+        return lf.collect()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PII REDACTION  — 8 pattern types (ported from TextInsightMiner)
@@ -322,33 +340,27 @@ class ConversationProcessor:
         if self.dataset_type == "auto":
             self.dataset_type = self._detect_from_df(df, col)
 
-        # ── Vectorised parse: replace iterrows() with Polars map_elements ──
-        # 1. Pull the transcript column as a Polars Series (zero-copy from numpy)
-        # 2. Pair with a row-index Series so _dispatch knows the conversation ID
-        # 3. map_elements runs the per-cell dispatcher in parallel Rust threads
-        texts   = pl.Series("text",  df[col].astype(str).values)
-        indices = pl.Series("idx",   np.arange(len(df), dtype=np.int32))
+        # ── Parallel parse via ThreadPoolExecutor — Cloud safe, no Polars Object type ──
+        # ThreadPoolExecutor gives parallelism without Polars involvement.
+        texts_arr = df[col].astype(str).values
+        n_rows    = len(texts_arr)
+        dispatch  = self._dispatch
 
-        dispatch = self._dispatch   # local ref avoids closure overhead
-
-        def _parse_cell(pair):
-            """Parse one (idx, text) struct — called by Polars map_elements."""
-            idx  = pair["idx"]
-            text = pair["text"]
+        def _parse_cell(args):
+            row_idx, text = args
             if not text or text == "nan" or len(text) < 5:
-                return None
-            turns = dispatch(text, int(idx))
-            return turns if turns else None
+                return []
+            return dispatch(text, row_idx) or []
 
-        # Build a struct Series and map over it
-        struct_s = pl.DataFrame({"idx": indices, "text": texts}).to_struct("pair")
-        results  = struct_s.map_elements(_parse_cell, return_dtype=pl.Object, skip_nulls=True)
+        # Use min(4, cpu) workers — enough parallelism without memory spike
+        n_workers = min(4, max(1, n_rows // 500))
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results = list(pool.map(_parse_cell, enumerate(texts_arr)))
 
-        # Flatten results (list of lists → flat list)
+        # Flatten results
         rows: List[Dict] = []
         for cell in results:
-            if cell:
-                rows.extend(cell)
+            rows.extend(cell)
 
         if not rows:
             raise ValueError("No turns parsed. Check the domain selector matches your file format.")
@@ -708,13 +720,9 @@ class AnalyticsEngine:
               .alias("consecutive_turns"),
         ]).drop("_streak_id")
 
-        # collect(streaming=True) — Polars processes the lazy plan row-by-row
-        # in Rust without materialising the full frame in Python heap.
-        # Falls back to standard collect() if streaming is unsupported.
-        try:
-            d = lf.collect(streaming=True).to_pandas()
-        except Exception:
-            d = lf.collect().to_pandas()
+        # _safe_collect() — version-safe streaming collect (lower RAM).
+        # Falls back to standard collect() if streaming is unsupported for this plan.
+        d = _safe_collect(lf).to_pandas()
         d = d.sort_values(["conversation_id","turn_sequence"]).reset_index(drop=True)
         gc.collect()
         return d
@@ -797,8 +805,9 @@ class AnalyticsEngine:
                        pl.col("compound").mean().alias("avg_sentiment"),
                        (pl.col("compound") >= 0).sum().cast(pl.Float64).alias("csat_n"),
                        (pl.col("compound") <  0).sum().cast(pl.Float64).alias("dsat_n"),
-                   ]).collect().to_dicts()
+                   ])
         )
+        phase_stats = _safe_collect(phase_stats).to_dicts()
         pcd: Dict[str, Dict] = {}
         for row in phase_stats:
             t = row["count"] or 1
@@ -927,7 +936,7 @@ def _cached_analytics(df_s: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
     For 120k+ turns that can spike RAM beyond 2GB.  Solution: collect()
     conversation-level aggregates first (tiny), join them back lazily,
     then collect the enriched frame in streaming mode using
-    collect(streaming=True) which Polars processes row-by-row in Rust.
+    _safe_collect() which uses Polars streaming engine row-by-row in Rust.
     """
     anal = AnalyticsEngine()
     df_r = anal.compute_turn_metrics(df_s)   # now uses streaming collect internally
