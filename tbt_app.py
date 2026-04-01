@@ -2291,7 +2291,7 @@ def render_sidebar():
 </div>""", unsafe_allow_html=True)
 
         st.markdown("### 🗂 Navigate")
-        pages=["🏠 Home","📊 Overview","🌊 Sankey Flow","🔄 TbT Flow","🗣️ Explorer","📋 Data Table","💡 Narrative & Export"]
+        pages=["🏠 Home","📊 Overview","🌊 Sankey Flow","⚠️ Escalation","🗣️ Explorer","💡 Narrative & Export"]
         for p in pages:
             is_active = st.session_state.get("page") == p
             if st.button(p, key=f"nav_{p}", type="primary" if is_active else "secondary"):
@@ -2708,30 +2708,37 @@ def page_sankey(df_r, ins):
 # ─── Overview ─────────────────────────────────────────────────────────────────
 def page_overview(df_r, ins):
     aggs = _precompute_aggs(df_r)
-    sh("📊","Phase-Level CSAT / DSAT"); _phase_table(ins)
-    sh("🌊","Sentiment Journey"); st.plotly_chart(_chart_waterfall(ins), width="stretch")
-    sh("📈","Visual Overview")
-    c1,c2=st.columns(2)
-    with c1: st.plotly_chart(_chart_sentiment_dist(aggs),    width="stretch")
-    with c2: st.plotly_chart(_chart_speaker_box(df_r),        width="stretch")
-    c3,c4=st.columns(2)
-    with c3: st.plotly_chart(_chart_phase_comparison(ins),          width="stretch")
-    with c4: st.plotly_chart(_chart_escalation_resolution(aggs),    width="stretch")
-    sh("🌐","Conversation Sunburst")
-    st.plotly_chart(_chart_sunburst(aggs), width="stretch")
-    sh("📉","Sentiment Progression")
+
+    # ── 1. Phase CSAT/DSAT health table ──────────────────────────────────────
+    sh("📊", "Phase-Level CSAT / DSAT")
+    _phase_table(ins)
+
+    # ── 2. CSAT vs DSAT bar + Start→End Sankey side by side ──────────────────
+    st.markdown("<br>", unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        sh("📈", "CSAT vs DSAT by Phase")
+        st.plotly_chart(_chart_phase_comparison(ins), width="stretch")
+    with c2:
+        sh("🎯", "Start → End Sentiment")
+        st.plotly_chart(_chart_sankey_start_to_end(aggs), width="stretch")
+
+    # ── 3. Sentiment progression by turn ─────────────────────────────────────
+    sh("📉", "Avg Sentiment by Turn  (first 30 turns)")
     st.plotly_chart(_chart_sentiment_progression(aggs), width="stretch")
 
-# ─── TbT Flow ────────────────────────────────────────────────────────────────
-def page_tbt_flow(df_r):
-    sh("🔄", "Turn-by-Turn Sentiment Flow")
+    # ── 4. Top escalation triggers ───────────────────────────────────────────
+    sh("⚠️", "Top Escalation Triggers")
+    _escalation_triggers_table(df_r, top_n=15)
 
-    # ── Cached conversation lists ──────────────────────────────────────────
+# ─── Explorer (merged TbT Flow + turn viewer + comparison) ──────────────────
+def page_explorer(df_r):
+    sh("🗣️", "Conversation Explorer")
+
     lists = _get_smart_conv_lists(df_r)
 
-    # ── Conversation selector row ──────────────────────────────────────────
+    # ── Selectors row ─────────────────────────────────────────────────────
     c_mode, c_search, c_view = st.columns([1.6, 2, 1.2])
-
     with c_mode:
         conv_mode = st.selectbox(
             "Quick filter",
@@ -2739,190 +2746,418 @@ def page_tbt_flow(df_r):
              "😡 Worst 20 (lowest customer sentiment)",
              "😊 Best 20 (highest customer sentiment)",
              "📏 Longest 20 (most turns)"],
-            key="flow_mode",
+            key="exp_mode",
         )
-
-    # Pick pool based on mode
     pool = {
-        "😡 Worst 20 (lowest customer sentiment)":  lists["worst20"],
-        "😊 Best 20 (highest customer sentiment)":  lists["best20"],
-        "📏 Longest 20 (most turns)":               lists["longest20"],
+        "😡 Worst 20 (lowest customer sentiment)": lists["worst20"],
+        "😊 Best 20 (highest customer sentiment)": lists["best20"],
+        "📏 Longest 20 (most turns)":              lists["longest20"],
     }.get(conv_mode, lists["all_ids"])
 
     with c_search:
         search_txt = st.text_input("🔍 Search conversation ID", value="",
-                                   placeholder="e.g. CONV_0042", key="flow_search")
+                                   placeholder="e.g. CONV_0042", key="exp_search")
         if search_txt.strip():
             pool = [c for c in lists["all_ids"]
                     if search_txt.strip().upper() in c.upper()] or pool
-
     with c_view:
         view_mode = st.radio("View", ["Single", "Compare ×2"],
-                             horizontal=True, key="flow_viewmode")
+                             horizontal=True, key="exp_viewmode")
 
-    # ── Speaker toggle + filters ───────────────────────────────────────────
+    # ── Conversation pickers ───────────────────────────────────────────────
     fc1, fc2, fc3 = st.columns([1, 1, 1])
     with fc1:
-        sel = st.selectbox("Conversation A", pool, key="flow_conv")
+        sel = st.selectbox("Conversation A", pool, key="exp_conv")
     with fc2:
-        spk_toggle = st.toggle("Split by speaker", value=True, key="flow_spk_toggle")
+        spk_toggle = st.toggle("Split by speaker", value=True, key="exp_spk_toggle")
     with fc3:
-        pflt = st.selectbox("Phase filter", ["All","start","middle","end"], key="flow_ph")
+        pflt = st.selectbox("Phase filter", ["All","start","middle","end"], key="exp_ph")
 
     sel_b = None
     if view_mode == "Compare ×2":
-        sel_b = st.selectbox("Conversation B", [c for c in pool if c != sel],
-                             key="flow_conv_b")
+        sel_b = st.selectbox("Conversation B",
+                             [c for c in pool if c != sel], key="exp_conv_b")
 
-    # ── Mini KPI strip for selected conversation ───────────────────────────
-    dv = df_r[df_r["conversation_id"] == sel].copy()
+    # ── Mini KPI strip ────────────────────────────────────────────────────
+    dv  = df_r[df_r["conversation_id"] == sel].copy()
     if pflt != "All": dv = dv[dv["phase"] == pflt]
-    cu = dv[dv["speaker"] == "CUSTOMER"]
-    ag = dv[dv["speaker"] == "AGENT"]
+    cu  = dv[dv["speaker"] == "CUSTOMER"]
+    ag  = dv[dv["speaker"] == "AGENT"]
     esc_n = int(dv["potential_escalation"].sum()) if "potential_escalation" in dv.columns else 0
     res_n = int(dv["potential_resolution"].sum()) if "potential_resolution" in dv.columns else 0
-
     k1,k2,k3,k4,k5 = st.columns(5)
     k1.metric("Turns",          len(df_r[df_r["conversation_id"]==sel]))
     k2.metric("Customer Avg",   f"{cu['compound'].mean():+.3f}" if not cu.empty else "—")
     k3.metric("Agent Avg",      f"{ag['compound'].mean():+.3f}" if not ag.empty else "—")
     k4.metric("⚠️ Escalations", esc_n,
-              delta="High" if esc_n > 2 else None,
-              delta_color="inverse")
+              delta="High" if esc_n > 2 else None, delta_color="inverse")
     k5.metric("✅ Resolutions",  res_n)
+    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
-    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-
-    # ── Main charts ────────────────────────────────────────────────────────
+    # ── Compare mode ──────────────────────────────────────────────────────
     if view_mode == "Compare ×2" and sel_b:
         sh("⚖️", f"Comparison: {sel} vs {sel_b}")
         st.plotly_chart(_chart_compare_two(df_r, sel, sel_b), width="stretch")
+        return
 
-    else:
-        # ── Tab set: Flow / Replay / Momentum / Heatmap ──
-        tab_flow, tab_replay, tab_mom, tab_heat = st.tabs([
-            "📈 Flow Chart", "▶ Replay", "📊 Momentum", "🌡️ Heatmap"
-        ])
+    # ── Single conversation tabs: Flow / Turn Viewer / Data ───────────────
+    tab_flow, tab_turns, tab_data = st.tabs([
+        "📈 Sentiment Flow", "🗣️ Turn Viewer", "📋 Data Table"
+    ])
 
-        with tab_flow:
-            st.plotly_chart(
+    with tab_flow:
+        st.plotly_chart(
+            _chart_tbt_flow(df_r, sel, show_speaker_lines=spk_toggle),
+            width="stretch",
+        )
+        try:
+            import plotly.io as pio
+            fig_bytes = pio.to_image(
                 _chart_tbt_flow(df_r, sel, show_speaker_lines=spk_toggle),
-                width="stretch",
+                format="png", width=1200, height=500, scale=2,
             )
-            # ── Export chart as PNG ──────────────────────────────────────
-            try:
-                import plotly.io as pio
-                fig_bytes = pio.to_image(
-                    _chart_tbt_flow(df_r, sel, show_speaker_lines=spk_toggle),
-                    format="png", width=1200, height=500, scale=2,
-                )
-                st.download_button(
-                    "📷 Export chart as PNG",
-                    data=fig_bytes,
-                    file_name=f"flow_{sel}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                    mime="image/png",
-                )
-            except Exception:
-                st.caption("PNG export requires `kaleido` — `pip install kaleido`")
+            st.download_button(
+                "📷 Export chart as PNG", data=fig_bytes,
+                file_name=f"flow_{sel}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                mime="image/png",
+            )
+        except Exception:
+            st.caption("PNG export requires `kaleido` — `pip install kaleido`")
 
-        with tab_replay:
-            st.caption("Press ▶ Play to watch sentiment evolve turn by turn, "
-                       "or drag the slider manually.")
-            st.plotly_chart(_chart_replay_animation(df_r, sel), width="stretch")
+    with tab_turns:
+        sub = df_r[df_r["conversation_id"] == sel]
+        if pflt != "All": sub = sub[sub["phase"] == pflt]
+        _turn_viewer(sub, sel)
 
-        with tab_mom:
-            st.plotly_chart(_chart_momentum(df_r, sel), width="stretch")
+    with tab_data:
+        sub = df_r[df_r["conversation_id"] == sel].copy()
+        cols = [c for c in ["turn_sequence","phase","speaker","timestamp","message",
+                             "sentiment_label","compound","sentiment_confidence",
+                             "potential_escalation","potential_resolution"] if c in sub.columns]
+        st.dataframe(sub[cols].reset_index(drop=True), width="stretch", height=420)
+        st.download_button(
+            "⬇️ Download this conversation (CSV)",
+            data=_to_csv(sub[cols]),
+            file_name=f"conv_{sel}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+        )
 
-        with tab_heat:
-            st.plotly_chart(_chart_speaker_heatmap(df_r, sel), width="stretch")
 
-# ─── Explorer ────────────────────────────────────────────────────────────────
-def page_explorer(df_r):
-    sh("🗣️","Conversation Explorer")
-    c1,c2=st.columns([1.2,1])
-    with c1: conv=st.selectbox("Conversation",sorted(df_r["conversation_id"].unique()),key="exp_conv")
-    with c2: ph  =st.selectbox("Phase",["All","start","middle","end"],key="exp_ph")
-    sub=df_r[df_r["conversation_id"]==conv]
-    if ph!="All": sub=sub[sub["phase"]==ph]
-    _turn_viewer(sub, conv)
 
-# ─── Data Table ──────────────────────────────────────────────────────────────
-def page_data_table(df_r):
-    sh("📋","Full Results Table")
-    c1,c2,c3=st.columns(3)
-    with c1: fs  =st.selectbox("Speaker",  ["All","CUSTOMER","AGENT"],key="dt_spk")
-    with c2: fsen=st.selectbox("Sentiment",["All","positive","neutral","negative"],key="dt_sen")
-    with c3: fp  =st.selectbox("Phase",    ["All","start","middle","end"],key="dt_ph")
-    dt=df_r.copy()
-    if fs!="All":   dt=dt[dt["speaker"]==fs]
-    if fsen!="All": dt=dt[dt["sentiment_label"]==fsen]
-    if fp!="All":   dt=dt[dt["phase"]==fp]
-    cols=[c for c in ["conversation_id","turn_sequence","phase","speaker","timestamp",
-                       "message","sentiment_label","compound","sentiment_confidence",
-                       "potential_escalation","potential_resolution"] if c in dt.columns]
-    total=len(dt); page_size=200
-    st.markdown(f"**{total:,} rows** after filters &nbsp;·&nbsp; showing {min(page_size,total):,} per page")
-    page_n=st.number_input("Page",min_value=1,max_value=max(1,(total-1)//page_size+1),value=1,step=1,key="dt_page")
-    start=(page_n-1)*page_size; end=min(start+page_size,total)
-    st.dataframe(dt[cols].iloc[start:end].reset_index(drop=True), width="stretch", height=420)
-    st.download_button("⬇️ Download filtered CSV",
-        data=_to_csv(dt[cols]),
-        file_name=f"tbt_filtered_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        mime="text/csv")
+# ─── Escalation helpers ──────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def _compute_escalation_intel(df: pd.DataFrame) -> dict:
+    """Pre-compute all escalation intelligence in one Polars pass."""
+    import re as _re
+
+    lf = pl.from_pandas(df).lazy()
+
+    # ── Escalated turns (customer, negative sentiment change) ──────────────
+    esc_df = (
+        lf.filter(
+            (pl.col("potential_escalation") == True) &
+            (pl.col("speaker") == "CUSTOMER")
+        ).collect().to_pandas()
+    )
+
+    # ── Trigger words: tokenise escalated messages, count word frequency ──
+    STOPWORDS = {
+        "i","the","a","an","and","or","but","in","on","at","to","for","of",
+        "is","was","are","were","be","been","have","has","had","do","did",
+        "not","no","my","your","we","they","it","this","that","with","you",
+        "me","so","if","up","can","will","just","don","t","s","re","ve","ll",
+        "get","got","its","our","he","she","they","them","their",
+    }
+    word_counts: Dict[str, int] = {}
+    conv_word:   Dict[str, set]  = {}   # word → set of conversation_ids
+
+    for _, row in esc_df.iterrows():
+        cid = str(row.get("conversation_id", ""))
+        msg = str(row.get("message", "")).lower()
+        words = _re.findall(r"[a-z]{3,}", msg)
+        for w in words:
+            if w in STOPWORDS: continue
+            word_counts[w] = word_counts.get(w, 0) + 1
+            conv_word.setdefault(w, set()).add(cid)
+
+    total_esc_convs = int(esc_df["conversation_id"].nunique()) if not esc_df.empty else 0
+    trigger_rows = sorted(
+        [{"word": w, "count": c, "convs": len(conv_word[w]),
+          "conv_pct": len(conv_word[w]) / max(total_esc_convs, 1)}
+         for w, c in word_counts.items()],
+        key=lambda x: x["count"], reverse=True
+    )[:25]
+
+    # ── Escalations by phase ───────────────────────────────────────────────
+    esc_phase = (
+        lf.filter(pl.col("potential_escalation") == True)
+          .group_by("phase")
+          .agg(pl.len().alias("escalations"))
+          .collect().to_pandas()
+    )
+
+    # ── Agent response after escalation ───────────────────────────────────
+    # For each escalation turn, look at the next AGENT turn's sentiment_change
+    df_sorted = df.sort_values(["conversation_id","turn_sequence"]).reset_index(drop=True)
+    df_sorted["_next_spk"]    = df_sorted.groupby("conversation_id")["speaker"].shift(-1)
+    df_sorted["_next_change"] = df_sorted.groupby("conversation_id")["sentiment_change"].shift(-1)
+    esc_mask  = df_sorted["potential_escalation"] == True
+    agent_response = df_sorted.loc[esc_mask & (df_sorted["_next_spk"] == "AGENT"), "_next_change"]
+    avg_agent_response = float(agent_response.mean()) if not agent_response.empty else 0.0
+
+    # ── Escalation-to-resolution funnel ───────────────────────────────────
+    total_convs      = int(df["conversation_id"].nunique())
+    esc_conv_ids     = set(esc_df["conversation_id"].unique()) if not esc_df.empty else set()
+    n_escalated      = len(esc_conv_ids)
+    res_df           = df[df["potential_resolution"] == True]
+    n_resolved       = int(len(set(res_df["conversation_id"]) & esc_conv_ids))
+    n_unresolved     = n_escalated - n_resolved
+
+    # ── Worst 10 conversations (lowest avg customer sentiment) ─────────────
+    worst = (
+        lf.filter(pl.col("speaker") == "CUSTOMER")
+          .group_by("conversation_id")
+          .agg([
+              pl.col("compound").mean().alias("avg_sentiment"),
+              pl.col("potential_escalation").sum().alias("escalations"),
+              pl.len().alias("turns"),
+          ])
+          .sort("avg_sentiment")
+          .head(10)
+          .collect().to_pandas()
+    )
+
+    return {
+        "trigger_rows":      trigger_rows,
+        "esc_phase":         esc_phase,
+        "avg_agent_response": avg_agent_response,
+        "total_convs":       total_convs,
+        "n_escalated":       n_escalated,
+        "n_resolved":        n_resolved,
+        "n_unresolved":      n_unresolved,
+        "esc_conv_ids":      list(esc_conv_ids),
+        "worst10":           worst,
+    }
+
+
+def _escalation_triggers_table(df_r: pd.DataFrame, top_n: int = 15):
+    """Render escalation trigger word table — used in Overview and Escalation page."""
+    intel = _compute_escalation_intel(df_r)
+    rows  = intel["trigger_rows"][:top_n]
+    if not rows:
+        st.info("No escalation turns detected in this dataset.")
+        return
+    total_esc = intel["n_escalated"]
+    html_rows = ""
+    for r in rows:
+        bar_w = int(r["conv_pct"] * 100)
+        bar_html = (
+            f'<div style="display:flex;align-items:center;gap:6px">'
+            f'<div style="flex:1;background:{C["warm"]};border-radius:4px;height:7px;overflow:hidden">'
+            f'<div style="width:{bar_w}%;height:100%;background:{C["neg"]};border-radius:4px"></div>'
+            f'</div>'
+            f'<span style="font-size:11px;color:{C["muted"]};width:36px;text-align:right">'
+            f'{r["conv_pct"]:.0%}</span></div>'
+        )
+        html_rows += (
+            f"<tr>"
+            f"<td><strong>{r['word']}</strong></td>"
+            f"<td style='text-align:right;font-family:monospace'>{r['count']:,}</td>"
+            f"<td style='text-align:right;font-family:monospace'>{r['convs']:,} / {total_esc:,}</td>"
+            f"<td style='min-width:140px'>{bar_html}</td>"
+            f"</tr>"
+        )
+    st.markdown(
+        f"<table class='pt'><thead><tr>"
+        f"<th>Trigger Word</th><th>Occurrences</th>"
+        f"<th>Escalated Conversations</th><th>% of Escalated Convs</th>"
+        f"</tr></thead><tbody>{html_rows}</tbody></table>",
+        unsafe_allow_html=True,
+    )
+
+
+# ─── Escalation Page ──────────────────────────────────────────────────────────
+def page_escalation(df_r, ins):
+    sh("⚠️", "Escalation Intelligence")
+    intel = _compute_escalation_intel(df_r)
+    cs    = ins["customer_satisfaction"]
+
+    # ── KPI strip ─────────────────────────────────────────────────────────
+    k1, k2, k3, k4, k5 = st.columns(5)
+    esc_rate  = cs["escalation_rate"]
+    res_rate  = cs["resolution_rate"]
+    esc_color = C["neg"] if esc_rate > 0.15 else C["warn"] if esc_rate > 0.10 else C["ok"]
+    res_color = C["ok"]  if res_rate > 0.60  else C["warn"] if res_rate > 0.40  else C["neg"]
+    with k1: st.markdown(mc("Total Conversations",  f"{intel['total_convs']:,}",         C["teal"]), unsafe_allow_html=True)
+    with k2: st.markdown(mc("Escalated",            f"{intel['n_escalated']:,}",          esc_color), unsafe_allow_html=True)
+    with k3: st.markdown(mc("Escalation Rate",      f"{esc_rate:.1%}",                    esc_color), unsafe_allow_html=True)
+    with k4: st.markdown(mc("Resolved",             f"{intel['n_resolved']:,}",           res_color), unsafe_allow_html=True)
+    with k5: st.markdown(mc("Resolution Rate",      f"{res_rate:.1%}",                    res_color), unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Section 1: Funnel + Phase breakdown ───────────────────────────────
+    col_funnel, col_phase = st.columns(2)
+
+    with col_funnel:
+        sh("🔻", "Escalation → Resolution Funnel")
+        n_esc  = intel["n_escalated"]
+        n_res  = intel["n_resolved"]
+        n_unr  = intel["n_unresolved"]
+        total  = intel["total_convs"]
+        n_clean = total - n_esc
+
+        fig = go.Figure(go.Funnel(
+            y=["All Conversations", "Escalated", "Resolved", "Unresolved"],
+            x=[total, n_esc, n_res, n_unr],
+            textinfo="value+percent initial",
+            marker=dict(color=[C["teal"], C["warn"], C["pos"], C["neg"]]),
+        ))
+        fig.update_layout(
+            height=320, margin=dict(l=10,r=10,t=30,b=10),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(family="DM Sans", color=C["text"]),
+        )
+        st.plotly_chart(fig, width="stretch")
+
+        # Agent response quality
+        avg_resp = intel["avg_agent_response"]
+        resp_col = C["pos"] if avg_resp > 0.05 else C["neg"] if avg_resp < -0.05 else C["gold"]
+        arrow    = "▲" if avg_resp > 0 else "▼"
+        st.markdown(
+            f'<div class="mc" style="border-top-color:{resp_col};margin-top:8px">'
+            f'<p class="mv"><span style="color:{resp_col}">{arrow} {avg_resp:+.3f}</span></p>'
+            f'<p class="ml">Avg Agent Sentiment Change After Escalation</p></div>',
+            unsafe_allow_html=True,
+        )
+
+    with col_phase:
+        sh("📊", "Escalations by Phase")
+        ep = intel["esc_phase"]
+        if not ep.empty:
+            ep_sorted = ep.sort_values("escalations", ascending=False)
+            fig2 = px.bar(
+                ep_sorted, x="phase", y="escalations",
+                color="phase",
+                color_discrete_map={"start": C["teal"], "middle": C["gold"], "end": C["neg"]},
+                labels={"phase": "Phase", "escalations": "Escalation Events"},
+            )
+            fig2.update_traces(marker_line_width=0)
+            fig2.update_layout(
+                height=320, showlegend=False,
+                margin=dict(l=10,r=10,t=30,b=10),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(family="DM Sans", color=C["text"]),
+            )
+            st.plotly_chart(fig2, width="stretch")
+        else:
+            st.info("No escalation phase data available.")
+
+    # ── Section 2: Trigger words ───────────────────────────────────────────
+    sh("🔑", "Top Escalation Trigger Words")
+    st.caption("Words most frequently spoken by customers immediately before or during escalation events.")
+    _escalation_triggers_table(df_r, top_n=20)
+
+    # ── Section 3: Worst conversations ────────────────────────────────────
+    sh("📉", "Worst 10 Conversations  — lowest avg customer sentiment")
+    worst = intel["worst10"]
+    if not worst.empty:
+        worst = worst.copy()
+        worst["avg_sentiment"] = worst["avg_sentiment"].round(3)
+        # Health badge
+        def _health(v):
+            if v >= 0.1:  return f'<span class="badge b-ok">Positive</span>'
+            if v >= -0.1: return f'<span class="badge b-warn">Neutral</span>'
+            return         f'<span class="badge b-err">Negative</span>'
+        rows_html = ""
+        for _, r in worst.iterrows():
+            rows_html += (
+                f"<tr>"
+                f"<td><strong>{r['conversation_id']}</strong></td>"
+                f"<td style='text-align:right;font-family:monospace'>{r['avg_sentiment']:+.3f}</td>"
+                f"<td style='text-align:right'>{int(r['escalations'])}</td>"
+                f"<td style='text-align:right'>{int(r['turns'])}</td>"
+                f"<td>{_health(r['avg_sentiment'])}</td>"
+                f"</tr>"
+            )
+        st.markdown(
+            f"<table class='pt'><thead><tr>"
+            f"<th>Conversation</th><th>Avg Sentiment</th>"
+            f"<th>Escalations</th><th>Turns</th><th>Health</th>"
+            f"</tr></thead><tbody>{rows_html}</tbody></table>",
+            unsafe_allow_html=True,
+        )
+        st.caption("Open any conversation in the Explorer page to see the full turn-by-turn flow.")
+    else:
+        st.info("No conversation data available.")
+
 
 # ─── Narrative & Export ───────────────────────────────────────────────────────
 def page_narrative_export(df_r, ins):
-    sh("💡","Narrative Intelligence")
-    cs=ins["customer_satisfaction"]; ap=ins["agent_performance"]
-    cp=ins["conversation_patterns"]; pcd=ins.get("phase_csat_dsat",{})
-    total=ins["total_turns"]; convs=ins["total_conversations"]
+    tab_nar, tab_data, tab_json = st.tabs(["💡 Executive Summary", "📋 Data Table", "🔍 Raw JSON"])
 
-    sv=("strongly positive" if ins["overall_sentiment"]["average"]>0.2
-        else "positive" if ins["overall_sentiment"]["average"]>0.05
-        else "neutral"  if ins["overall_sentiment"]["average"]>-0.05
-        else "negative" if ins["overall_sentiment"]["average"]>-0.2
-        else "strongly negative")
-    tv=("improving" if cp["sentiment_improvement"]>0.05
-        else "declining" if cp["sentiment_improvement"]<-0.05 else "stable")
+    with tab_nar:
+        sh("💡","Narrative Intelligence")
+        cs=ins["customer_satisfaction"]; ap=ins["agent_performance"]
+        cp=ins["conversation_patterns"]; pcd=ins.get("phase_csat_dsat",{})
+        total=ins["total_turns"]; convs=ins["total_conversations"]
+        sv=("strongly positive" if ins["overall_sentiment"]["average"]>0.2
+            else "positive" if ins["overall_sentiment"]["average"]>0.05
+            else "neutral"  if ins["overall_sentiment"]["average"]>-0.05
+            else "negative" if ins["overall_sentiment"]["average"]>-0.2
+            else "strongly negative")
+        tv=("improving" if cp["sentiment_improvement"]>0.05
+            else "declining" if cp["sentiment_improvement"]<-0.05 else "stable")
+        paras=[
+            f"**Dataset overview:** {convs:,} conversations totalling **{total:,} turns** were analysed. Average turns per conversation: **{ins['avg_turns_per_conversation']:.1f}**.",
+            f"**Overall sentiment** is **{sv}** (avg {ins['overall_sentiment']['average']:+.3f}). Customer avg {cs['average_sentiment']:+.3f} · Agent avg {ap['average_sentiment']:+.3f}.",
+            f"**Trend** is **{tv}** — sentiment shifts {cp['sentiment_improvement']:+.3f} from start to end. Start {cp['avg_sentiment_start']:+.3f} → Middle {cp['avg_sentiment_middle']:+.3f} → End {cp['avg_sentiment_end']:+.3f}.",
+            f"**Escalation rate** {_pct(cs['escalation_rate'])} · **Resolution rate** {_pct(cs['resolution_rate'])}. " + ("Escalation above 15% — investigate trigger topics. " if cs['escalation_rate']>0.15 else "") + ("Resolution below 50% — improve closing strategies." if cs['resolution_rate']<0.5 else ""),
+        ]
+        for pn in ["start","middle","end"]:
+            p=pcd.get(pn,{})
+            if p.get("count",0)>0:
+                paras.append(f"**{pn.capitalize()} phase** ({p['count']:,} customer turns): CSAT {_pct(p['csat_pct'])} · DSAT {_pct(p['dsat_pct'])} · avg {p['avg_sentiment']:+.3f}.")
+        card_top = (
+            f'<div style="background:{C["card"]};border:1px solid {C["border"]};border-radius:12px;'
+            f'padding:1.5rem 1.8rem;margin-bottom:1rem;border-left:4px solid {C["teal"]}">'
+            f'<div style="font-size:11px;color:{C["muted"]};text-transform:uppercase;'
+            f'letter-spacing:1.2px;margin-bottom:.8rem;font-weight:600">Executive Summary — Auto-Generated</div>'
+        )
+        st.markdown(card_top, unsafe_allow_html=True)
+        for p in paras: st.markdown(p)
+        st.markdown("</div>", unsafe_allow_html=True)
+        sh("🔔","Recommendations")
+        for rec in ins.get("recommendations",[]): st.markdown(f'<div class="rc">{rec}</div>',unsafe_allow_html=True)
+        st.markdown("---")
+        _export_section(df_r, ins)
 
-    paras=[
-        f"**Dataset overview:** {convs:,} conversations totalling **{total:,} turns** were analysed. "
-        f"Average turns per conversation: **{ins['avg_turns_per_conversation']:.1f}**.",
+    with tab_data:
+        sh("📋","Full Results Table")
+        c1,c2,c3=st.columns(3)
+        with c1: fs  =st.selectbox("Speaker",  ["All","CUSTOMER","AGENT"],key="dt_spk")
+        with c2: fsen=st.selectbox("Sentiment",["All","positive","neutral","negative"],key="dt_sen")
+        with c3: fp  =st.selectbox("Phase",    ["All","start","middle","end"],key="dt_ph")
+        dt=df_r.copy()
+        if fs!="All":   dt=dt[dt["speaker"]==fs]
+        if fsen!="All": dt=dt[dt["sentiment_label"]==fsen]
+        if fp!="All":   dt=dt[dt["phase"]==fp]
+        cols=[c for c in ["conversation_id","turn_sequence","phase","speaker","timestamp",
+                           "message","sentiment_label","compound","sentiment_confidence",
+                           "potential_escalation","potential_resolution"] if c in dt.columns]
+        total_r=len(dt); page_size=200
+        st.markdown(f"**{total_r:,} rows** after filters &nbsp;·&nbsp; showing {min(page_size,total_r):,} per page")
+        page_n=st.number_input("Page",min_value=1,max_value=max(1,(total_r-1)//page_size+1),value=1,step=1,key="dt_page")
+        s=(page_n-1)*page_size; e=min(s+page_size,total_r)
+        st.dataframe(dt[cols].iloc[s:e].reset_index(drop=True), width="stretch", height=420)
+        st.download_button("⬇️ Download filtered CSV",
+            data=_to_csv(dt[cols]),
+            file_name=f"tbt_filtered_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv")
 
-        f"**Overall sentiment** is **{sv}** (avg {ins['overall_sentiment']['average']:+.3f}). "
-        f"Customer avg {cs['average_sentiment']:+.3f} · Agent avg {ap['average_sentiment']:+.3f}.",
-
-        f"**Trend** is **{tv}** — sentiment shifts {cp['sentiment_improvement']:+.3f} from start to end. "
-        f"Start {cp['avg_sentiment_start']:+.3f} → Middle {cp['avg_sentiment_middle']:+.3f} → End {cp['avg_sentiment_end']:+.3f}.",
-
-        f"**Escalation rate** {_pct(cs['escalation_rate'])} · **Resolution rate** {_pct(cs['resolution_rate'])}. "
-        + ("Escalation above 15% threshold — investigate trigger topics. " if cs['escalation_rate']>0.15 else "")
-        + ("Resolution below 50% — closing strategies need improvement." if cs['resolution_rate']<0.5 else ""),
-    ]
-    for pn in ["start","middle","end"]:
-        p=pcd.get(pn,{})
-        if p.get("count",0)>0:
-            paras.append(f"**{pn.capitalize()} phase** ({p['count']:,} customer turns): "
-                         f"CSAT {_pct(p['csat_pct'])} · DSAT {_pct(p['dsat_pct'])} · avg {p['avg_sentiment']:+.3f}.")
-
-    st.markdown(f"""
-<div style="background:{C['card']};border:1px solid {C['border']};border-radius:12px;
-     padding:1.5rem 1.8rem;margin-bottom:1rem;border-left:4px solid {C['teal']}">
-  <div style="font-size:11px;color:{C['muted']};text-transform:uppercase;letter-spacing:1.2px;
-       margin-bottom:.8rem;font-weight:600">Executive Summary — Auto-Generated</div>
-""", unsafe_allow_html=True)
-    for p in paras: st.markdown(p)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    sh("🔔","Recommendations")
-    for rec in ins.get("recommendations",[]): st.markdown(f'<div class="rc">{rec}</div>',unsafe_allow_html=True)
-
-    st.markdown("---")
-    _export_section(df_r, ins)
-    st.markdown("---")
-    sh("🔍","Raw Insights JSON")
-    with st.expander("View full insights object"): st.json(ins)
-
+    with tab_json:
+        sh("🔍","Raw Insights JSON")
+        st.json(ins)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
@@ -3052,10 +3287,9 @@ def main():
 
     if   page == "📊 Overview":           page_overview(df_r, ins)
     elif page == "🌊 Sankey Flow":         page_sankey(df_r, ins)
-    elif page == "🔄 TbT Flow":           page_tbt_flow(df_r)
-    elif page == "🗣️ Explorer":           page_explorer(df_r)
-    elif page == "📋 Data Table":         page_data_table(df_r)
-    elif page == "💡 Narrative & Export": page_narrative_export(df_r, ins)
+    elif page == "⚠️ Escalation":          page_escalation(df_r, ins)
+    elif page == "🗣️ Explorer":            page_explorer(df_r)
+    elif page == "💡 Narrative & Export":  page_narrative_export(df_r, ins)
 
     st.markdown(
         f'<div style="text-align:center;color:{C["muted"]};font-size:11px;padding:16px 0">'
