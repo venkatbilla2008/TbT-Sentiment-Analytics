@@ -141,10 +141,62 @@ FORMAT_LABELS: Dict[str, str] = {
     "ppt":     "🩼 Healthcare B  (Chat / SMS)",
 }
 PHASE_ICONS   = {"start": "🚀", "middle": "🔄", "end": "🏁"}
-MAX_TURNS     = 100_000   # hard safety cap — 100k turns fits in 1GB Cloud RAM
-CHUNK_TURNS   = 5_000     # VADER batch size — 5k rows ≈ 50MB peak per batch
-CHART_SAMPLE  = 5_000     # max points sent to browser for scatter/sunburst
-VADER_WORKERS = 2         # 2 threads on Cloud (1GB RAM); increase locally if RAM allows
+
+# ── Environment-aware performance limits ──────────────────────────────────────
+# Auto-detects Cloud (1 GB RAM) vs local machine and sets limits accordingly.
+# Local machines get generous limits so large datasets (1L+ turns) work fine.
+# Override any value via environment variable, e.g.:
+#   MAX_TURNS=500000 streamlit run tbt_app.py          (Mac/Linux)
+#   set MAX_TURNS=500000 && streamlit run tbt_app.py   (Windows)
+def _detect_env_limits() -> dict:
+    import os
+    try:
+        import psutil
+        _ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+        _cpu    = psutil.cpu_count(logical=False) or 1
+    except Exception:
+        try:
+            with open("/proc/meminfo") as _f:
+                _ram_gb = next(
+                    int(l.split()[1]) / (1024 ** 2)
+                    for l in _f if "MemTotal" in l
+                )
+        except Exception:
+            _ram_gb = 2.0
+        _cpu = os.cpu_count() or 1
+
+    _is_cloud = bool(
+        os.environ.get("STREAMLIT_SHARING_MODE") or
+        os.environ.get("IS_STREAMLIT_CLOUD") or
+        _ram_gb < 1.5
+    )
+
+    if _is_cloud:
+        _lim = dict(MAX_TURNS=100_000, CHUNK_TURNS=5_000,
+                    CHART_SAMPLE=5_000, VADER_WORKERS=2)
+    elif _ram_gb >= 32:
+        _lim = dict(MAX_TURNS=1_000_000, CHUNK_TURNS=50_000,
+                    CHART_SAMPLE=25_000, VADER_WORKERS=min(_cpu, 8))
+    elif _ram_gb >= 16:
+        _lim = dict(MAX_TURNS=500_000,   CHUNK_TURNS=25_000,
+                    CHART_SAMPLE=15_000, VADER_WORKERS=min(_cpu, 6))
+    else:
+        _lim = dict(MAX_TURNS=250_000,   CHUNK_TURNS=10_000,
+                    CHART_SAMPLE=10_000, VADER_WORKERS=min(_cpu, 4))
+
+    for _k in _lim:
+        if os.environ.get(_k):
+            try:
+                _lim[_k] = int(os.environ[_k])
+            except ValueError:
+                pass
+    return _lim
+
+_ENV_LIMITS   = _detect_env_limits()
+MAX_TURNS     = _ENV_LIMITS["MAX_TURNS"]    # hard cap on turns processed
+CHUNK_TURNS   = _ENV_LIMITS["CHUNK_TURNS"]  # VADER batch size per chunk
+CHART_SAMPLE  = _ENV_LIMITS["CHART_SAMPLE"] # max points sent to browser
+VADER_WORKERS = _ENV_LIMITS["VADER_WORKERS"]# parallel VADER threads
 CHART_LAYOUT  = dict(
     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
     font=dict(color=C['text'], family="DM Sans"),
@@ -987,10 +1039,21 @@ def run_pipeline(
     if n_raw > MAX_TURNS:
         df_p = df_p.iloc[:MAX_TURNS].copy()
         gc.collect()
-        st.warning(
-            f"⚠️ Dataset capped at {MAX_TURNS:,} turns (your file had {n_raw:,}). "
-            "Split into smaller files for full analysis."
-        )
+        import os as _os
+        _is_cloud = bool(_os.environ.get("STREAMLIT_SHARING_MODE") or
+                         _os.environ.get("IS_STREAMLIT_CLOUD"))
+        if _is_cloud:
+            st.warning(
+                f"⚠️ Dataset capped at {MAX_TURNS:,} turns (your file had {n_raw:,}). "
+                "Streamlit Cloud is limited to 1 GB RAM. "
+                "Run locally with `streamlit run tbt_app.py` to process the full dataset, "
+                "or set the MAX_TURNS env variable to increase the cap."
+            )
+        else:
+            st.info(
+                f"ℹ️ Dataset capped at {MAX_TURNS:,} turns (your file had {n_raw:,}). "
+                f"To raise the cap, run: MAX_TURNS={n_raw} streamlit run tbt_app.py"
+            )
 
     # ── Soft warning: large dataset — tell user it may take a moment ──────────
     n_turns = len(df_p)
@@ -2328,9 +2391,23 @@ def render_sidebar():
                 unsafe_allow_html=True,
             )
 
+        # Show active performance profile
+        import os as _os
+        try:
+            import psutil as _ps
+            _ram = f"{_ps.virtual_memory().total/(1024**3):.0f} GB RAM"
+        except Exception:
+            _ram = "RAM unknown"
+        _is_cloud = bool(_os.environ.get("STREAMLIT_SHARING_MODE") or
+                         _os.environ.get("IS_STREAMLIT_CLOUD"))
+        _env_label = "☁️ Cloud" if _is_cloud else "🖥️ Local"
         st.markdown(
-            f'<div style="color:{C["muted"]};font-size:.7rem;text-align:center;padding-top:.5rem">'
-            f'v5.0 — Polars · Parallel VADER · 5-stage Cache</div>',
+            f'<div style="color:{C["muted"]};font-size:.68rem;text-align:center;'
+            f'padding-top:.5rem;line-height:1.6">'
+            f'v5.0 — Polars · Parallel VADER · 5-stage Cache<br>'
+            f'{_env_label} · {_ram} · '
+            f'Cap: <strong>{MAX_TURNS:,}</strong> turns · '
+            f'{VADER_WORKERS} VADER threads</div>',
             unsafe_allow_html=True,
         )
 
@@ -2483,7 +2560,7 @@ def page_sankey(df_r, ins):
         )
         st.plotly_chart(
             _chart_sankey_phase_flow(aggs),
-            use_container_width=True,
+            width="stretch",
         )
 
     with tab2:
@@ -2505,7 +2582,7 @@ def page_sankey(df_r, ins):
             )
         st.plotly_chart(
             _chart_sankey_turn_transitions(aggs, spk_filter),
-            use_container_width=True,
+            width="stretch",
         )
 
         # Transition matrix table
@@ -2559,7 +2636,7 @@ def page_sankey(df_r, ins):
         )
         st.plotly_chart(
             _chart_sankey_speaker_journey(aggs),
-            use_container_width=True,
+            width="stretch",
         )
 
     with tab4:
@@ -2574,7 +2651,7 @@ def page_sankey(df_r, ins):
         )
         st.plotly_chart(
             _chart_sankey_start_to_end(aggs),
-            use_container_width=True,
+            width="stretch",
         )
 
         # Highlight key business findings
