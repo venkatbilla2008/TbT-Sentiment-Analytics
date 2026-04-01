@@ -24,7 +24,7 @@ Run:  streamlit run tbt_app.py
 
 from __future__ import annotations
 
-import gc, io, json, os, re, warnings, zipfile
+import gc, io, json, re, warnings, zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -141,70 +141,10 @@ FORMAT_LABELS: Dict[str, str] = {
     "ppt":     "🩼 Healthcare B  (Chat / SMS)",
 }
 PHASE_ICONS   = {"start": "🚀", "middle": "🔄", "end": "🏁"}
-
-# ── Environment auto-detection ────────────────────────────────────────────────
-# Detects whether the app is running on Streamlit Cloud (1 GB RAM limit) or
-# on a local machine with full RAM, and sets all performance constants
-# automatically.  No manual editing needed — just run locally with:
-#   streamlit run tbt_app.py
-#
-# Detection logic (in priority order):
-#   1. STREAMLIT_SHARING_MODE env var  → definitive Cloud signal
-#   2. Available system RAM via psutil → <2 GB = treat as Cloud-constrained
-#   3. Default                         → assume local (permissive limits)
-# ─────────────────────────────────────────────────────────────────────────────
-def _detect_env() -> dict:
-    """Return a dict of performance constants tuned for the current environment."""
-
-    # --- Try to read available RAM via psutil (optional dependency) -----------
-    _ram_gb = 99.0   # default: assume large RAM if psutil unavailable
-    try:
-        import psutil
-        _ram_gb = psutil.virtual_memory().available / 1_073_741_824  # bytes → GB
-    except ImportError:
-        pass
-
-    # --- Cloud signal: Streamlit Cloud sets this env var ---------------------
-    _on_cloud = (
-        os.environ.get("STREAMLIT_SHARING_MODE") == "true"   # Streamlit Cloud
-        or os.environ.get("IS_STREAMLIT_CLOUD", "") == "1"   # custom override
-        or _ram_gb < 2.0                                       # <2 GB avail RAM
-    )
-
-    if _on_cloud:
-        # Streamlit Cloud free tier: 1 GB RAM, 2 vCPUs
-        # Conservative limits to avoid OOM kill
-        return dict(
-            MAX_TURNS     = 100_000,   # hard cap
-            CHUNK_TURNS   = 5_000,     # VADER batch size
-            CHART_SAMPLE  = 5_000,     # browser scatter/sunburst cap
-            VADER_WORKERS = 2,         # threads
-            ENV_LABEL     = "☁️ Cloud",
-            ENV_RAM_GB    = round(_ram_gb, 1),
-        )
-    else:
-        # Local machine: use full available RAM
-        # Scale limits with RAM: 1 lakh turns ≈ 500 MB peak
-        _max_turns     = min(int(_ram_gb * 50_000), 2_000_000)  # ~50k turns per GB
-        _chunk_turns   = min(int(_ram_gb * 5_000),  50_000)     # ~5k per GB
-        _chart_sample  = 25_000                                  # full chart fidelity
-        _vader_workers = min(int(_ram_gb * 1.5), 12)            # scale with RAM/CPU
-        return dict(
-            MAX_TURNS     = _max_turns,
-            CHUNK_TURNS   = _chunk_turns,
-            CHART_SAMPLE  = _chart_sample,
-            VADER_WORKERS = _vader_workers,
-            ENV_LABEL     = "🖥️ Local",
-            ENV_RAM_GB    = round(_ram_gb, 1),
-        )
-
-_ENV            = _detect_env()
-MAX_TURNS       = _ENV["MAX_TURNS"]
-CHUNK_TURNS     = _ENV["CHUNK_TURNS"]
-CHART_SAMPLE    = _ENV["CHART_SAMPLE"]
-VADER_WORKERS   = _ENV["VADER_WORKERS"]
-_ENV_LABEL      = _ENV["ENV_LABEL"]
-_ENV_RAM_GB     = _ENV["ENV_RAM_GB"]
+MAX_TURNS     = 100_000   # hard safety cap — 100k turns fits in 1GB Cloud RAM
+CHUNK_TURNS   = 5_000     # VADER batch size — 5k rows ≈ 50MB peak per batch
+CHART_SAMPLE  = 5_000     # max points sent to browser for scatter/sunburst
+VADER_WORKERS = 2         # 2 threads on Cloud (1GB RAM); increase locally if RAM allows
 CHART_LAYOUT  = dict(
     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
     font=dict(color=C['text'], family="DM Sans"),
@@ -1049,17 +989,15 @@ def run_pipeline(
         gc.collect()
         st.warning(
             f"⚠️ Dataset capped at {MAX_TURNS:,} turns (your file had {n_raw:,}). "
-            f"Running in {_ENV_LABEL} mode ({_ENV_RAM_GB} GB available RAM). "
-            "To process more turns, run locally with more RAM."
+            "Split into smaller files for full analysis."
         )
 
-    # ── Soft info: large dataset — tell user it may take a moment ─────────────
+    # ── Soft warning: large dataset — tell user it may take a moment ──────────
     n_turns = len(df_p)
     if n_turns > 50_000:
-        est_mins = max(1, round(n_turns / 30_000))
         st.info(
-            f"📊 {_ENV_LABEL} · {n_turns:,} turns · ~{est_mins} min to score. "
-            "Processing in streaming batches…"
+            f"📊 Large dataset: {n_turns:,} turns. "
+            "Scoring in streaming batches — this may take 1–2 minutes."
         )
 
     # ── Stage 2: Score (chunked streaming — OOM safe) ─────────────────────────
@@ -1073,8 +1011,7 @@ def run_pipeline(
         raise MemoryError(
             f"Out of memory while scoring {n_turns:,} turns. "
             f"The dataset is too large for available RAM. "
-            f"Running in {_ENV_LABEL} mode ({_ENV_RAM_GB} GB RAM). "
-            f"Try uploading ≤ {CHUNK_TURNS:,} rows at a time, or run locally for larger datasets."
+            f"Try uploading ≤ {CHUNK_TURNS:,} rows at a time."
         )
 
     # ── Stage 3: Analytics (Polars streaming collect — OOM safe) ─────────────
@@ -1197,13 +1134,89 @@ def _precompute_aggs(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     n = len(df)
     sample = df if n <= CHART_SAMPLE else df.sample(n=CHART_SAMPLE, random_state=42)
 
+    # ── Sankey pre-aggregations ───────────────────────────────────────────────
+    # 1. Phase-to-phase sentiment flow  (Start → Middle → End)
+    #    For each conversation: dominant sentiment label per phase
+    #    Then count conversation-level transitions between phases
+    cust_df = pl.from_pandas(df[df["speaker"] == "CUSTOMER"].copy()).lazy()
+
+    phase_dom = (
+        cust_df
+        .group_by(["conversation_id", "phase", "sentiment_label"])
+        .agg(pl.len().alias("n"))
+        .sort(["conversation_id", "phase", "n"], descending=[False, False, True])
+        .group_by(["conversation_id", "phase"])
+        .agg(pl.col("sentiment_label").first().alias("dominant"))
+        .collect().to_pandas()
+    )
+
+    # Pivot: one row per conversation, columns = start/middle/end dominant
+    phase_pivot = phase_dom.pivot_table(
+        index="conversation_id", columns="phase",
+        values="dominant", aggfunc="first"
+    ).reset_index()
+    for ph in ["start", "middle", "end"]:
+        if ph not in phase_pivot.columns:
+            phase_pivot[ph] = "neutral"
+    phase_pivot = phase_pivot.fillna("neutral")
+
+    # Start → Middle flow
+    sm_flow = (
+        phase_pivot.groupby(["start", "middle"])
+        .size().reset_index(name="count")
+        .rename(columns={"start": "source", "middle": "target"})
+    )
+    # Middle → End flow
+    me_flow = (
+        phase_pivot.groupby(["middle", "end"])
+        .size().reset_index(name="count")
+        .rename(columns={"middle": "source", "end": "target"})
+    )
+    # Start → End (direct arc — skip middle)
+    se_flow = (
+        phase_pivot.groupby(["start", "end"])
+        .size().reset_index(name="count")
+        .rename(columns={"start": "source", "end": "target"})
+    )
+
+    # 2. Turn-by-turn consecutive sentiment transitions (all turns, all speakers)
+    #    e.g. positive→neutral, neutral→negative, etc.
+    df_sorted = pl.from_pandas(
+        df.sort_values(["conversation_id", "turn_sequence"])
+    ).lazy()
+    turn_flow = (
+        df_sorted
+        .with_columns(
+            pl.col("sentiment_label").shift(1).over("conversation_id").alias("prev_label")
+        )
+        .filter(pl.col("prev_label").is_not_null())
+        .group_by(["prev_label", "sentiment_label", "speaker"])
+        .agg(pl.len().alias("count"))
+        .collect().to_pandas()
+        .rename(columns={"prev_label": "source", "sentiment_label": "target"})
+    )
+
+    # 3. Speaker-sentiment Sankey: Speaker → Phase → Sentiment
+    spk_phase_sent = (
+        lf.group_by(["speaker", "phase", "sentiment_label"])
+          .agg(pl.len().alias("count"))
+          .collect().to_pandas()
+    )
+
     return {
-        "sent_dist":    sent_dist,
-        "conv_map":     conv_map,
-        "phase_speaker":phase_speaker,
-        "turn_prog":    turn_prog,
-        "esc_res":      esc_res,
-        "sample":       sample,
+        "sent_dist":      sent_dist,
+        "conv_map":       conv_map,
+        "phase_speaker":  phase_speaker,
+        "turn_prog":      turn_prog,
+        "esc_res":        esc_res,
+        "sample":         sample,
+        # Sankey data
+        "sm_flow":        sm_flow,
+        "me_flow":        me_flow,
+        "se_flow":        se_flow,
+        "turn_flow":      turn_flow,
+        "phase_pivot":    phase_pivot,
+        "spk_phase_sent": spk_phase_sent,
     }
 
 
@@ -1252,6 +1265,283 @@ def _chart_sentiment_progression(aggs):
         fill="tozeroy",fillcolor="rgba(45,95,110,0.1)"))
     return apply_chart(fig.update_layout(title="Avg Sentiment by Turn (first 30)",
         title_font_size=14,xaxis=dict(title="Turn"),yaxis=dict(title="Avg Score")))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SANKEY CHART FACTORIES
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Colour palette for sentiment labels — shared across all Sankey charts
+_SENT_HEX = {
+    "positive": C['pos'],   # green
+    "neutral":  C['neu'],   # blue
+    "negative": C['neg'],   # red
+}
+_PHASE_HEX = {
+    "start":  "#2D5F6E",    # teal
+    "middle": "#D4B94E",    # gold
+    "end":    "#A04040",    # red-brown
+}
+
+def _sankey_node_color(label: str) -> str:
+    label_l = label.lower()
+    for k, v in _SENT_HEX.items():
+        if k in label_l: return v
+    for k, v in _PHASE_HEX.items():
+        if k in label_l: return v
+    return C['slate']
+
+def _build_sankey(labels, sources, targets, values, colors_node,
+                  colors_link, title: str, height: int = 520) -> go.Figure:
+    """Core Sankey builder — all 4 charts call this."""
+    fig = go.Figure(go.Sankey(
+        arrangement="snap",
+        node=dict(
+            pad=20, thickness=22,
+            line=dict(color=C['border'], width=0.5),
+            label=labels,
+            color=colors_node,
+            hovertemplate="<b>%{label}</b><br>Total flow: %{value:,}<extra></extra>",
+        ),
+        link=dict(
+            source=sources,
+            target=targets,
+            value=values,
+            color=colors_link,
+            hovertemplate=(
+                "<b>%{source.label}</b> → <b>%{target.label}</b><br>"
+                "Conversations: <b>%{value:,}</b><extra></extra>"
+            ),
+        ),
+    ))
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=14, color=C['text']), x=0),
+        height=height,
+        margin=dict(l=10, r=10, t=50, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="DM Sans", color=C['text'], size=12),
+    )
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def _chart_sankey_phase_flow(aggs: dict) -> go.Figure:
+    """
+    Sankey 1 — Phase Sentiment Flow  (Start → Middle → End)
+    --------------------------------------------------------
+    Each conversation is classified by its dominant customer sentiment
+    per phase (positive / neutral / negative).
+    Flows show how many conversations moved through each sentiment
+    state as the call progressed.
+    """
+    sm  = aggs["sm_flow"]   # start→middle
+    me  = aggs["me_flow"]   # middle→end
+
+    PHASES  = ["start",  "middle", "end"]
+    SENTIMS = ["positive", "neutral", "negative"]
+
+    # Build unique node list:  "Start Positive", "Middle Neutral", etc.
+    node_labels = []
+    node_idx    = {}
+    for ph in PHASES:
+        for s in SENTIMS:
+            lbl = f"{ph.capitalize()}\n{s.capitalize()}"
+            node_idx[(ph, s)] = len(node_labels)
+            node_labels.append(lbl)
+
+    node_colors = [_sankey_node_color(lbl) for lbl in node_labels]
+
+    srcs, tgts, vals, link_colors = [], [], [], []
+
+    def _add_flow(flow_df, src_phase, tgt_phase):
+        for _, row in flow_df.iterrows():
+            s = str(row["source"]).lower()
+            t = str(row["target"]).lower()
+            if s not in SENTIMS: s = "neutral"
+            if t not in SENTIMS: t = "neutral"
+            v = int(row["count"])
+            if v <= 0: continue
+            srcs.append(node_idx[(src_phase, s)])
+            tgts.append(node_idx[(tgt_phase, t)])
+            vals.append(v)
+            # Link colour = source node colour at 40% opacity
+            hex_c = _SENT_HEX.get(s, C['slate'])
+            r,g,b = int(hex_c[1:3],16), int(hex_c[3:5],16), int(hex_c[5:7],16)
+            link_colors.append(f"rgba({r},{g},{b},0.35)")
+
+    _add_flow(sm, "start", "middle")
+    _add_flow(me, "middle", "end")
+
+    if not vals:
+        fig = go.Figure()
+        fig.add_annotation(text="No data — need Start, Middle & End phases",
+                           xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+        return fig
+
+    return _build_sankey(node_labels, srcs, tgts, vals, node_colors, link_colors,
+                         title="🌊 Sentiment Flow: Start → Middle → End  (customer dominant sentiment per phase)")
+
+
+@st.cache_data(show_spinner=False)
+def _chart_sankey_turn_transitions(aggs: dict, speaker_filter: str = "ALL") -> go.Figure:
+    """
+    Sankey 2 — Turn-by-Turn Sentiment Transitions
+    -----------------------------------------------
+    Shows how many turns moved between each pair of sentiment labels
+    (positive↔neutral↔negative) on consecutive turns within a conversation.
+    Filterable by speaker (ALL / CUSTOMER / AGENT).
+    """
+    tf = aggs["turn_flow"].copy()
+    if speaker_filter != "ALL":
+        tf = tf[tf["speaker"] == speaker_filter]
+
+    tf = tf.groupby(["source", "target"], as_index=False)["count"].sum()
+    tf = tf[tf["count"] > 0]
+
+    SENTIMS = ["positive", "neutral", "negative"]
+    # Source nodes on left, target nodes on right — prefix to keep them separate
+    src_labels = [f"{s.capitalize()} (from)" for s in SENTIMS]
+    tgt_labels = [f"{s.capitalize()} (to)"   for s in SENTIMS]
+    all_labels = src_labels + tgt_labels
+
+    node_colors = [_SENT_HEX.get(s, C['slate']) for s in SENTIMS] * 2
+
+    srcs, tgts, vals, link_colors = [], [], [], []
+    for _, row in tf.iterrows():
+        s = str(row["source"]).lower()
+        t = str(row["target"]).lower()
+        if s not in SENTIMS or t not in SENTIMS: continue
+        v = int(row["count"])
+        si = SENTIMS.index(s)
+        ti = len(SENTIMS) + SENTIMS.index(t)
+        srcs.append(si); tgts.append(ti); vals.append(v)
+        hex_c = _SENT_HEX.get(s, C['slate'])
+        r,g,b = int(hex_c[1:3],16), int(hex_c[3:5],16), int(hex_c[5:7],16)
+        link_colors.append(f"rgba({r},{g},{b},0.35)")
+
+    if not vals:
+        fig = go.Figure()
+        fig.add_annotation(text="No transition data available",
+                           xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+        return fig
+
+    spk_label = f"({speaker_filter})" if speaker_filter != "ALL" else "(All Speakers)"
+    return _build_sankey(all_labels, srcs, tgts, vals, node_colors, link_colors,
+                         title=f"🔀 Turn-by-Turn Sentiment Transitions {spk_label}  (consecutive turns within conversations)")
+
+
+@st.cache_data(show_spinner=False)
+def _chart_sankey_speaker_journey(aggs: dict) -> go.Figure:
+    """
+    Sankey 3 — Speaker → Phase → Sentiment
+    ----------------------------------------
+    Three-level hierarchy: who spoke → which phase → what sentiment.
+    Reveals whether AGENT or CUSTOMER drives negativity at each phase.
+    """
+    sps = aggs["spk_phase_sent"].copy()
+    sps = sps[sps["count"] > 0]
+
+    speakers = ["CUSTOMER", "AGENT"]
+    phases   = ["start", "middle", "end"]
+    sentims  = ["positive", "neutral", "negative"]
+
+    # Node layout: [speakers] → [phase buckets per speaker] → [sentiment sinks]
+    labels = []
+    idx    = {}
+    # Layer 1: speakers
+    for spk in speakers:
+        idx[("spk", spk)] = len(labels)
+        labels.append(spk.capitalize())
+    # Layer 2: speaker × phase
+    for spk in speakers:
+        for ph in phases:
+            idx[("spk_ph", spk, ph)] = len(labels)
+            labels.append(f"{spk.capitalize()}\n{ph.capitalize()}")
+    # Layer 3: sentiment sinks
+    for s in sentims:
+        idx[("sent", s)] = len(labels)
+        labels.append(s.capitalize())
+
+    node_colors = (
+        [_PHASE_HEX.get("start", C['teal'])] * len(speakers) +
+        [_sankey_node_color(f"{ph}") for spk in speakers for ph in phases] +
+        [_SENT_HEX.get(s, C['slate']) for s in sentims]
+    )
+
+    srcs, tgts, vals, link_colors = [], [], [], []
+
+    for _, row in sps.iterrows():
+        spk = str(row["speaker"]).upper()
+        ph  = str(row["phase"]).lower()
+        s   = str(row["sentiment_label"]).lower()
+        v   = int(row["count"])
+        if spk not in speakers or ph not in phases or s not in sentims: continue
+
+        # Link 1: speaker → speaker×phase
+        srcs.append(idx[("spk",    spk)])
+        tgts.append(idx[("spk_ph", spk, ph)])
+        vals.append(v)
+        link_colors.append("rgba(45,95,110,0.25)")
+
+        # Link 2: speaker×phase → sentiment
+        srcs.append(idx[("spk_ph", spk, ph)])
+        tgts.append(idx[("sent",   s)])
+        vals.append(v)
+        hex_c = _SENT_HEX.get(s, C['slate'])
+        r,g,b = int(hex_c[1:3],16), int(hex_c[3:5],16), int(hex_c[5:7],16)
+        link_colors.append(f"rgba({r},{g},{b},0.30)")
+
+    if not vals:
+        fig = go.Figure()
+        fig.add_annotation(text="No data", xref="paper", yref="paper",
+                           x=0.5, y=0.5, showarrow=False)
+        return fig
+
+    return _build_sankey(labels, srcs, tgts, vals, node_colors, link_colors,
+                         title="👥 Speaker → Phase → Sentiment  (who drives what sentiment, when)",
+                         height=580)
+
+
+@st.cache_data(show_spinner=False)
+def _chart_sankey_start_to_end(aggs: dict) -> go.Figure:
+    """
+    Sankey 4 — Direct Start → End Sentiment  (skip middle)
+    --------------------------------------------------------
+    Answers the key business question:
+    "Of conversations that started positive, how many ended negative?"
+    Shows every Start sentiment → End sentiment pairing.
+    """
+    se = aggs["se_flow"].copy()
+    se = se[se["count"] > 0]
+
+    SENTIMS = ["positive", "neutral", "negative"]
+    src_labels = [f"Start {s.capitalize()}" for s in SENTIMS]
+    tgt_labels = [f"End {s.capitalize()}"   for s in SENTIMS]
+    all_labels = src_labels + tgt_labels
+
+    node_colors = [_SENT_HEX.get(s, C['slate']) for s in SENTIMS] * 2
+
+    srcs, tgts, vals, link_colors = [], [], [], []
+    for _, row in se.iterrows():
+        s = str(row["source"]).lower()
+        t = str(row["target"]).lower()
+        if s not in SENTIMS or t not in SENTIMS: continue
+        v = int(row["count"])
+        si = SENTIMS.index(s)
+        ti = len(SENTIMS) + SENTIMS.index(t)
+        srcs.append(si); tgts.append(ti); vals.append(v)
+        hex_c = _SENT_HEX.get(s, C['slate'])
+        r,g,b = int(hex_c[1:3],16), int(hex_c[3:5],16), int(hex_c[5:7],16)
+        link_colors.append(f"rgba({r},{g},{b},0.38)")
+
+    if not vals:
+        fig = go.Figure()
+        fig.add_annotation(text="No data", xref="paper", yref="paper",
+                           x=0.5, y=0.5, showarrow=False)
+        return fig
+
+    return _build_sankey(all_labels, srcs, tgts, vals, node_colors, link_colors,
+                         title="🎯 Start → End Sentiment  (how conversations open vs. close — skips middle)")
 
 def _chart_escalation_resolution(aggs):
     er=aggs["esc_res"]; tot=er["convs"].iloc[0]
@@ -1938,7 +2228,7 @@ def render_sidebar():
 </div>""", unsafe_allow_html=True)
 
         st.markdown("### 🗂 Navigate")
-        pages=["🏠 Home","📊 Overview","🔄 TbT Flow","🗣️ Explorer","📋 Data Table","💡 Narrative & Export"]
+        pages=["🏠 Home","📊 Overview","🌊 Sankey Flow","🔄 TbT Flow","🗣️ Explorer","📋 Data Table","💡 Narrative & Export"]
         for p in pages:
             is_active = st.session_state.get("page") == p
             if st.button(p, key=f"nav_{p}", type="primary" if is_active else "secondary"):
@@ -2040,9 +2330,7 @@ def render_sidebar():
 
         st.markdown(
             f'<div style="color:{C["muted"]};font-size:.7rem;text-align:center;padding-top:.5rem">'
-            f'v5.1 — Polars · Parallel VADER · 5-stage Cache<br>'
-            f'{_ENV_LABEL} &nbsp;·&nbsp; {_ENV_RAM_GB} GB RAM &nbsp;·&nbsp; '
-            f'{VADER_WORKERS} workers &nbsp;·&nbsp; {MAX_TURNS:,} turn cap</div>',
+            f'v5.0 — Polars · Parallel VADER · 5-stage Cache</div>',
             unsafe_allow_html=True,
         )
 
@@ -2145,6 +2433,199 @@ def _export_section(df_r, ins):
                     unsafe_allow_html=True)
         st.download_button("📥 Download ZIP (.zip)", data=_to_zip(df_r,ins),
             file_name=f"tbt_{ts}.zip", mime="application/zip", width="stretch", type="primary")
+
+
+# ─── Sankey Flow ──────────────────────────────────────────────────────────────
+def page_sankey(df_r, ins):
+    aggs = _precompute_aggs(df_r)
+
+    sh("🌊", "Sentiment Flow Analysis — Sankey Charts")
+
+    # ── Insight summary strip ──────────────────────────────────────────────────
+    pcd  = ins.get("phase_csat_dsat", {})
+    s_cs = pcd.get("start",  {}).get("csat_pct", 0)
+    e_cs = pcd.get("end",    {}).get("csat_pct", 0)
+    m_ds = pcd.get("middle", {}).get("dsat_pct", 0)
+    delta = e_cs - s_cs
+    d_col = C["pos"] if delta >= 0 else C["neg"]
+    d_arrow = "▲" if delta >= 0 else "▼"
+
+    ka, kb, kc, kd = st.columns(4)
+    with ka:
+        st.markdown(mc("Start CSAT",   f"{s_cs:.0%}", C["pos"]),  unsafe_allow_html=True)
+    with kb:
+        st.markdown(mc("End CSAT",     f"{e_cs:.0%}", C["ok"]),   unsafe_allow_html=True)
+    with kc:
+        st.markdown(mc("Middle DSAT",  f"{m_ds:.0%}", C["warn"]), unsafe_allow_html=True)
+    with kd:
+        st.markdown(mc("Start→End Δ",
+                       f'<span style="color:{d_col}">{d_arrow} {abs(delta):.0%}</span>',
+                       d_col), unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Tab layout — one tab per Sankey ───────────────────────────────────────
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🌊 Phase Flow",
+        "🔀 Turn Transitions",
+        "👥 Speaker Journey",
+        "🎯 Start → End",
+    ])
+
+    with tab1:
+        st.markdown(
+            f'<div style="background:{C["warm_l"]};border-left:3px solid {C["teal"]};'
+            f'border-radius:6px;padding:8px 14px;font-size:12px;color:{C["text2"]};margin-bottom:12px">'
+            f'📖 <strong>How to read:</strong> Each block is a phase (Start / Middle / End). '
+            f'Each colour is a sentiment (🟢 Positive · 🔵 Neutral · 🔴 Negative). '
+            f'Band width = number of conversations carrying that sentiment into the next phase.</div>',
+            unsafe_allow_html=True,
+        )
+        st.plotly_chart(
+            _chart_sankey_phase_flow(aggs),
+            use_container_width=True,
+        )
+
+    with tab2:
+        st.markdown(
+            f'<div style="background:{C["warm_l"]};border-left:3px solid {C["teal"]};'
+            f'border-radius:6px;padding:8px 14px;font-size:12px;color:{C["text2"]};margin-bottom:10px">'
+            f'📖 <strong>How to read:</strong> Left side = sentiment of the current turn. '
+            f'Right side = sentiment of the very next turn in the same conversation. '
+            f'Band width = number of turn-level transitions. '
+            f'A thick band from Positive(from) → Negative(to) means sentiment drops sharply between turns.</div>',
+            unsafe_allow_html=True,
+        )
+        spk_col, _ = st.columns([1, 3])
+        with spk_col:
+            spk_filter = st.selectbox(
+                "Filter by speaker",
+                ["ALL", "CUSTOMER", "AGENT"],
+                key="sankey_spk",
+            )
+        st.plotly_chart(
+            _chart_sankey_turn_transitions(aggs, spk_filter),
+            use_container_width=True,
+        )
+
+        # Transition matrix table
+        tf = aggs["turn_flow"].copy()
+        if spk_filter != "ALL":
+            tf = tf[tf["speaker"] == spk_filter]
+        tf = tf.groupby(["source", "target"], as_index=False)["count"].sum()
+        tf = tf.sort_values("count", ascending=False)
+        if not tf.empty:
+            st.markdown(
+                f'<div class="sh" style="margin-top:16px">📋 Transition Matrix '
+                f'<span style="font-size:11px;color:{C["muted"]};font-weight:400"> — '
+                f'sorted by volume</span></div>',
+                unsafe_allow_html=True,
+            )
+            tf["movement"] = tf["source"].str.capitalize() + " → " + tf["target"].str.capitalize()
+            tf["pct"] = (tf["count"] / tf["count"].sum() * 100).round(1).astype(str) + "%"
+            # Colour-code based on movement type
+            def _mv_badge(row):
+                s, t = row["source"].lower(), row["target"].lower()
+                if s == t:    return f'<span class="badge b-info">↔ Stable</span>'
+                pos_s = ["positive"]; neg_s = ["negative"]
+                if s in neg_s and t in pos_s:   return f'<span class="badge b-ok">↑ Recovery</span>'
+                if s in pos_s and t in neg_s:   return f'<span class="badge b-err">↓ Decline</span>'
+                if t == "neutral":               return f'<span class="badge b-warn">→ Neutral</span>'
+                return f'<span class="badge b-info">→ Shift</span>'
+            tf["type"] = tf.apply(_mv_badge, axis=1)
+            rows_html = ""
+            for _, r in tf.iterrows():
+                rows_html += (
+                    f"<tr><td>{r['movement']}</td>"
+                    f"<td style='text-align:right;font-family:monospace'>{int(r['count']):,}</td>"
+                    f"<td style='text-align:right'>{r['pct']}</td>"
+                    f"<td>{r['type']}</td></tr>"
+                )
+            st.markdown(
+                f"<table class='pt'><thead><tr>"
+                f"<th>Transition</th><th>Count</th><th>Share</th><th>Type</th>"
+                f"</tr></thead><tbody>{rows_html}</tbody></table>",
+                unsafe_allow_html=True,
+            )
+
+    with tab3:
+        st.markdown(
+            f'<div style="background:{C["warm_l"]};border-left:3px solid {C["teal"]};'
+            f'border-radius:6px;padding:8px 14px;font-size:12px;color:{C["text2"]};margin-bottom:12px">'
+            f'📖 <strong>How to read:</strong> Left = Speaker. Middle = Speaker × Phase. '
+            f'Right = final Sentiment. Trace a band from CUSTOMER → Start → Negative '
+            f'to see how many customer turns in the Start phase were negative.</div>',
+            unsafe_allow_html=True,
+        )
+        st.plotly_chart(
+            _chart_sankey_speaker_journey(aggs),
+            use_container_width=True,
+        )
+
+    with tab4:
+        st.markdown(
+            f'<div style="background:{C["warm_l"]};border-left:3px solid {C["teal"]};'
+            f'border-radius:6px;padding:8px 14px;font-size:12px;color:{C["text2"]};margin-bottom:12px">'
+            f'📖 <strong>How to read:</strong> Left = sentiment at the start of the conversation. '
+            f'Right = sentiment at the end. The key band to watch is '
+            f'<strong>Start Positive → End Negative</strong> — those are conversations that deteriorated. '
+            f'<strong>Start Negative → End Positive</strong> = successful recoveries.</div>',
+            unsafe_allow_html=True,
+        )
+        st.plotly_chart(
+            _chart_sankey_start_to_end(aggs),
+            use_container_width=True,
+        )
+
+        # Highlight key business findings
+        se = aggs["se_flow"].copy()
+        se = se[se["count"] > 0]
+        total_convs = se["count"].sum()
+        if total_convs > 0:
+            # Deteriorated: pos→neg
+            det = se[(se["source"]=="positive") & (se["target"]=="negative")]["count"].sum()
+            # Recovered:   neg→pos
+            rec = se[(se["source"]=="negative") & (se["target"]=="positive")]["count"].sum()
+            # Stable pos:  pos→pos
+            stp = se[(se["source"]=="positive") & (se["target"]=="positive")]["count"].sum()
+            # Stable neg:  neg→neg
+            stn = se[(se["source"]=="negative") & (se["target"]=="negative")]["count"].sum()
+
+            st.markdown("---")
+            sh("💡", "Key Business Findings")
+            f1, f2, f3, f4 = st.columns(4)
+            with f1:
+                st.markdown(mc("😊 Stayed Positive",  f"{int(stp):,}",
+                               C["pos"]), unsafe_allow_html=True)
+            with f2:
+                st.markdown(mc("📉 Deteriorated",     f"{int(det):,}",
+                               C["neg"]), unsafe_allow_html=True)
+            with f3:
+                st.markdown(mc("📈 Recovered",        f"{int(rec):,}",
+                               C["ok"]), unsafe_allow_html=True)
+            with f4:
+                st.markdown(mc("😞 Stayed Negative",  f"{int(stn):,}",
+                               C["err"] if hasattr(C,"err") else C["neg"]),
+                            unsafe_allow_html=True)
+
+            if det > 0:
+                det_pct = det / total_convs
+                st.markdown(
+                    f'<div class="rc" style="border-left:3px solid {C["neg"]};margin-top:10px">'
+                    f'⚠️ <strong>{det_pct:.1%} of conversations deteriorated</strong> '
+                    f'(started positive, ended negative) — '
+                    f'{"Critical: review agent scripts & de-escalation training." if det_pct > 0.15 else "Monitor closely."}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            if rec > 0:
+                rec_pct = rec / total_convs
+                st.markdown(
+                    f'<div class="rc" style="border-left:3px solid {C["pos"]};margin-top:6px">'
+                    f'✅ <strong>{rec_pct:.1%} of conversations recovered</strong> '
+                    f'(started negative, ended positive) — agents are resolving issues effectively.</div>',
+                    unsafe_allow_html=True,
+                )
 
 
 # ─── Overview ─────────────────────────────────────────────────────────────────
@@ -2493,6 +2974,7 @@ def main():
     st.markdown("---")
 
     if   page == "📊 Overview":           page_overview(df_r, ins)
+    elif page == "🌊 Sankey Flow":         page_sankey(df_r, ins)
     elif page == "🔄 TbT Flow":           page_tbt_flow(df_r)
     elif page == "🗣️ Explorer":           page_explorer(df_r)
     elif page == "📋 Data Table":         page_data_table(df_r)
