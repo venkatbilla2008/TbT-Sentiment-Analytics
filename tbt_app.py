@@ -3161,7 +3161,7 @@ def _escalation_triggers_table(df_r: pd.DataFrame, top_n: int = 15):
         )
         html_rows += (
             f"<tr>"
-            f"<td><strong>{r['word']}</strong></td>"
+            f"<td><strong>{r['phrase']}</strong></td>"
             f"<td style='text-align:right;font-family:monospace'>{r['count']:,}</td>"
             f"<td style='text-align:right;font-family:monospace'>{r['convs']:,} / {total_esc:,}</td>"
             f"<td style='min-width:140px'>{bar_html}</td>"
