@@ -24,7 +24,7 @@ Run:  streamlit run tbt_app.py
 
 from __future__ import annotations
 
-import gc, io, json, re, warnings, zipfile
+import gc, io, json, os, re, warnings, zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -141,10 +141,70 @@ FORMAT_LABELS: Dict[str, str] = {
     "ppt":     "🩼 Healthcare B  (Chat / SMS)",
 }
 PHASE_ICONS   = {"start": "🚀", "middle": "🔄", "end": "🏁"}
-MAX_TURNS     = 100_000   # hard safety cap — 100k turns fits in 1GB Cloud RAM
-CHUNK_TURNS   = 5_000     # VADER batch size — 5k rows ≈ 50MB peak per batch
-CHART_SAMPLE  = 5_000     # max points sent to browser for scatter/sunburst
-VADER_WORKERS = 2         # 2 threads on Cloud (1GB RAM); increase locally if RAM allows
+
+# ── Environment auto-detection ────────────────────────────────────────────────
+# Detects whether the app is running on Streamlit Cloud (1 GB RAM limit) or
+# on a local machine with full RAM, and sets all performance constants
+# automatically.  No manual editing needed — just run locally with:
+#   streamlit run tbt_app.py
+#
+# Detection logic (in priority order):
+#   1. STREAMLIT_SHARING_MODE env var  → definitive Cloud signal
+#   2. Available system RAM via psutil → <2 GB = treat as Cloud-constrained
+#   3. Default                         → assume local (permissive limits)
+# ─────────────────────────────────────────────────────────────────────────────
+def _detect_env() -> dict:
+    """Return a dict of performance constants tuned for the current environment."""
+
+    # --- Try to read available RAM via psutil (optional dependency) -----------
+    _ram_gb = 99.0   # default: assume large RAM if psutil unavailable
+    try:
+        import psutil
+        _ram_gb = psutil.virtual_memory().available / 1_073_741_824  # bytes → GB
+    except ImportError:
+        pass
+
+    # --- Cloud signal: Streamlit Cloud sets this env var ---------------------
+    _on_cloud = (
+        os.environ.get("STREAMLIT_SHARING_MODE") == "true"   # Streamlit Cloud
+        or os.environ.get("IS_STREAMLIT_CLOUD", "") == "1"   # custom override
+        or _ram_gb < 2.0                                       # <2 GB avail RAM
+    )
+
+    if _on_cloud:
+        # Streamlit Cloud free tier: 1 GB RAM, 2 vCPUs
+        # Conservative limits to avoid OOM kill
+        return dict(
+            MAX_TURNS     = 100_000,   # hard cap
+            CHUNK_TURNS   = 5_000,     # VADER batch size
+            CHART_SAMPLE  = 5_000,     # browser scatter/sunburst cap
+            VADER_WORKERS = 2,         # threads
+            ENV_LABEL     = "☁️ Cloud",
+            ENV_RAM_GB    = round(_ram_gb, 1),
+        )
+    else:
+        # Local machine: use full available RAM
+        # Scale limits with RAM: 1 lakh turns ≈ 500 MB peak
+        _max_turns     = min(int(_ram_gb * 50_000), 2_000_000)  # ~50k turns per GB
+        _chunk_turns   = min(int(_ram_gb * 5_000),  50_000)     # ~5k per GB
+        _chart_sample  = 25_000                                  # full chart fidelity
+        _vader_workers = min(int(_ram_gb * 1.5), 12)            # scale with RAM/CPU
+        return dict(
+            MAX_TURNS     = _max_turns,
+            CHUNK_TURNS   = _chunk_turns,
+            CHART_SAMPLE  = _chart_sample,
+            VADER_WORKERS = _vader_workers,
+            ENV_LABEL     = "🖥️ Local",
+            ENV_RAM_GB    = round(_ram_gb, 1),
+        )
+
+_ENV            = _detect_env()
+MAX_TURNS       = _ENV["MAX_TURNS"]
+CHUNK_TURNS     = _ENV["CHUNK_TURNS"]
+CHART_SAMPLE    = _ENV["CHART_SAMPLE"]
+VADER_WORKERS   = _ENV["VADER_WORKERS"]
+_ENV_LABEL      = _ENV["ENV_LABEL"]
+_ENV_RAM_GB     = _ENV["ENV_RAM_GB"]
 CHART_LAYOUT  = dict(
     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
     font=dict(color=C['text'], family="DM Sans"),
@@ -171,7 +231,7 @@ def _safe_collect(lf: pl.LazyFrame) -> pl.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PII REDACTION  — 8 pattern types (ported from TextInsightMiner)
+# PII REDACTION  — 8 pattern types
 # ─────────────────────────────────────────────────────────────────────────────
 class PIIRedactor:
     """
@@ -989,15 +1049,17 @@ def run_pipeline(
         gc.collect()
         st.warning(
             f"⚠️ Dataset capped at {MAX_TURNS:,} turns (your file had {n_raw:,}). "
-            "Split into smaller files for full analysis."
+            f"Running in {_ENV_LABEL} mode ({_ENV_RAM_GB} GB available RAM). "
+            "To process more turns, run locally with more RAM."
         )
 
-    # ── Soft warning: large dataset — tell user it may take a moment ──────────
+    # ── Soft info: large dataset — tell user it may take a moment ─────────────
     n_turns = len(df_p)
     if n_turns > 50_000:
+        est_mins = max(1, round(n_turns / 30_000))
         st.info(
-            f"📊 Large dataset: {n_turns:,} turns. "
-            "Scoring in streaming batches — this may take 1–2 minutes."
+            f"📊 {_ENV_LABEL} · {n_turns:,} turns · ~{est_mins} min to score. "
+            "Processing in streaming batches…"
         )
 
     # ── Stage 2: Score (chunked streaming — OOM safe) ─────────────────────────
@@ -1011,7 +1073,8 @@ def run_pipeline(
         raise MemoryError(
             f"Out of memory while scoring {n_turns:,} turns. "
             f"The dataset is too large for available RAM. "
-            f"Try uploading ≤ {CHUNK_TURNS:,} rows at a time."
+            f"Running in {_ENV_LABEL} mode ({_ENV_RAM_GB} GB RAM). "
+            f"Try uploading ≤ {CHUNK_TURNS:,} rows at a time, or run locally for larger datasets."
         )
 
     # ── Stage 3: Analytics (Polars streaming collect — OOM safe) ─────────────
@@ -1977,7 +2040,9 @@ def render_sidebar():
 
         st.markdown(
             f'<div style="color:{C["muted"]};font-size:.7rem;text-align:center;padding-top:.5rem">'
-            f'v5.0 — Polars · Parallel VADER · 5-stage Cache</div>',
+            f'v5.1 — Polars · Parallel VADER · 5-stage Cache<br>'
+            f'{_ENV_LABEL} &nbsp;·&nbsp; {_ENV_RAM_GB} GB RAM &nbsp;·&nbsp; '
+            f'{VADER_WORKERS} workers &nbsp;·&nbsp; {MAX_TURNS:,} turn cap</div>',
             unsafe_allow_html=True,
         )
 
