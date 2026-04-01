@@ -385,6 +385,74 @@ class ConversationProcessor:
             re.DOTALL
         )
 
+    # Known column names that hold a conversation / session identifier
+    # Exact-match candidates — checked first (most specific → least specific).
+    # Add any new domain-specific ID column names here.
+    _ID_COLS = [
+        # ── Conversation / Chat variants ──
+        "Conversation Id", "Conversation ID", "conversation_id", "ConversationId",
+        "conversation id", "CONVERSATION_ID", "Conversation_Id", "Conversation_ID",
+        # ── Ticket / Support variants ──
+        "CS Ticket ID", "CS Ticket Id", "cs_ticket_id", "Ticket ID", "Ticket Id",
+        "ticket_id", "TicketId", "ticket id", "TICKET_ID",
+        # ── Chat / Interaction variants ──
+        "Chat No", "Chat No.", "chat_no", "ChatNo", "CHAT_NO",
+        "Chat ID", "Chat Id", "chat_id", "ChatId", "chat id",
+        "Interaction ID", "Interaction Id", "interaction_id", "InteractionId",
+        # ── Session variants ──
+        "Session Id", "Session ID", "session_id", "SessionId",
+        "session id", "SESSION_ID",
+        # ── Call variants ──
+        "Call Id", "Call ID", "call_id", "CallId", "call id", "CALL_ID",
+        "Call No", "Call No.", "call_no", "CallNo",
+        # ── Integer / Reference ID variants ──
+        "Int ID", "Int Id", "int_id", "IntId", "INT_ID",
+        "Ref ID", "Ref Id", "ref_id", "RefId", "Reference ID", "Reference Id",
+        "Case ID", "Case Id", "case_id", "CaseId", "case id",
+        # ── Generic ID (checked last — most likely to conflict) ──
+        "ID", "Id", "id",
+    ]
+
+    def _find_id_col(self, df: pd.DataFrame) -> Optional[str]:
+        """
+        Find the conversation ID column in *df*.
+
+        Strategy (in order):
+        1. Exact match against _ID_COLS list (most-specific first).
+        2. Case-insensitive substring match: any column whose lowercase name
+           contains "id", "no", "ticket", "chat", "session", "call", "ref",
+           "case", or "interaction" — but only if it looks like an ID column
+           (high cardinality: unique values >= 80% of rows).
+        """
+        # ── Pass 1: exact match ───────────────────────────────────────────────
+        for name in self._ID_COLS:
+            if name in df.columns:
+                return name
+
+        # ── Pass 2: fuzzy match on column name with cardinality guard ─────────
+        ID_KEYWORDS = ("ticket", "chat", "session", "call", "conversation",
+                       "interaction", "case", "reference", "ref", "int id",
+                       "chat no", "call no")
+        n = max(len(df), 1)
+        for col in df.columns:
+            col_lower = col.lower().strip()
+            # Must contain at least one ID keyword
+            if not any(kw in col_lower for kw in ID_KEYWORDS):
+                # Also accept bare "id" / "no" columns if high cardinality
+                if not (col_lower in ("id", "no", "no.") or
+                        col_lower.endswith(" id") or col_lower.endswith("_id") or
+                        col_lower.endswith(" no") or col_lower.endswith("_no")):
+                    continue
+            # Cardinality guard: genuine ID columns are highly unique
+            try:
+                n_unique = df[col].nunique()
+                if n_unique / n >= 0.5:   # at least 50% unique values
+                    return col
+            except Exception:
+                pass
+
+        return None
+
     def parse(self, df: pd.DataFrame) -> pd.DataFrame:
         col = self._find_col(df)
         if not col:
@@ -392,8 +460,13 @@ class ConversationProcessor:
         if self.dataset_type == "auto":
             self.dataset_type = self._detect_from_df(df, col)
 
-        # ── Parallel parse via ThreadPoolExecutor — Cloud safe, no Polars Object type ──
-        # ThreadPoolExecutor gives parallelism without Polars involvement.
+        # ── Detect real conversation ID column ───────────────────────────
+        # If the source file has a Conversation Id column, use those values.
+        # Otherwise fall back to generating CONV_XXXX from the row index.
+        id_col  = self._find_id_col(df)
+        id_arr  = df[id_col].astype(str).values if id_col else None
+
+        # ── Parallel parse via ThreadPoolExecutor — Cloud safe ────────────
         texts_arr = df[col].astype(str).values
         n_rows    = len(texts_arr)
         dispatch  = self._dispatch
@@ -402,7 +475,8 @@ class ConversationProcessor:
             row_idx, text = args
             if not text or text == "nan" or len(text) < 5:
                 return []
-            return dispatch(text, row_idx) or []
+            real_id = str(id_arr[row_idx]) if id_arr is not None else ""
+            return dispatch(text, row_idx, conv_id=real_id) or []
 
         # Use min(4, cpu) workers — enough parallelism without memory spike
         n_workers = min(4, max(1, n_rows // 500))
@@ -456,11 +530,11 @@ class ConversationProcessor:
         """Back-compat wrapper — delegates to _detect_format."""
         return self._detect_format(s)
 
-    def _dispatch(self, text, idx):
-        if self.dataset_type == "netflix":  return self._parse_bracket(text, idx)
-        if self.dataset_type == "humana":   return self._parse_humana(text, idx)
-        if self.dataset_type == "ppt":      return self._parse_ppt(text, idx)
-        return self._parse_spotify(text, idx)
+    def _dispatch(self, text, idx, conv_id: str = ""):
+        if self.dataset_type == "netflix":  return self._parse_bracket(text, idx, conv_id)
+        if self.dataset_type == "humana":   return self._parse_humana(text, idx, conv_id)
+        if self.dataset_type == "ppt":      return self._parse_ppt(text, idx, conv_id)
+        return self._parse_spotify(text, idx, conv_id)
 
     def _find_col(self, df):
         for n in self._PRIO:
@@ -479,17 +553,20 @@ class ConversationProcessor:
         if u in {"CUSTOMER","CONSUMER","CLIENT","USER","MEMBER","PATIENT","CALLER"}: return "CUSTOMER"
         return u
 
-    def _row(self, idx, seq, ts, spk, msg):
-        return {"conversation_id": f"CONV_{idx+1:04d}", "turn_sequence": seq,
+    def _row(self, idx, seq, ts, spk, msg, conv_id: str = ""):
+        # Use real conversation ID from source data when available;
+        # fall back to sequential CONV_XXXX only when no ID column exists.
+        cid = conv_id if conv_id and str(conv_id) not in ("", "nan", "None") else f"CONV_{idx+1:04d}"
+        return {"conversation_id": cid, "turn_sequence": seq,
                 "timestamp": ts, "speaker": spk, "message": msg}
 
-    def _parse_bracket(self, text, idx):
+    def _parse_bracket(self, text, idx, conv_id: str = ""):
         lines=text.split("\n"); turns=[]; tn=1; cs=ct=None; cm=[]
         def flush():
             nonlocal tn
             if cs:
                 msg=" ".join(cm).strip()
-                if msg: turns.append(self._row(idx,tn,ct,self._norm(cs),msg)); tn+=1
+                if msg: turns.append(self._row(idx,tn,ct,self._norm(cs),msg,conv_id)); tn+=1
         for line in lines:
             ls=line.strip(); m=self._pb.match(ls)
             if m:
@@ -499,13 +576,13 @@ class ConversationProcessor:
             elif cs and ls: cm.append(ls)
         flush(); return turns
 
-    def _parse_spotify(self, text, idx):
+    def _parse_spotify(self, text, idx, conv_id: str = ""):
         lines=text.split("\n"); turns=[]; tn=1; cs=ct=None; cm=[]
         def flush():
             nonlocal tn
             if cs:
                 msg=" ".join(cm).strip()
-                if msg: turns.append(self._row(idx,tn,ct,self._norm(cs),msg)); tn+=1
+                if msg: turns.append(self._row(idx,tn,ct,self._norm(cs),msg,conv_id)); tn+=1
         for line in lines:
             ls=line.strip().lstrip("|").strip()  # strip leading pipe used by some Spotify exports
             m=self._pt.search(ls)                # search() handles (?:^|\n) anchor in pattern
@@ -514,7 +591,7 @@ class ConversationProcessor:
             elif cs and ls: cm.append(ls)
         flush(); return turns
 
-    def _parse_humana(self, text, idx):
+    def _parse_humana(self, text, idx, conv_id: str = ""):
         turns=[]; tn=1
         for ts,spk,msg in self._ph.findall(text):
             sl=spk.strip().lower()
@@ -524,17 +601,17 @@ class ConversationProcessor:
             ns=("CUSTOMER" if any(k in sl for k in ["member","customer","patient","caller"])
                 else "AGENT" if any(k in sl for k in ["agent","representative","rep","advisor","specialist"])
                 else spk.strip().upper())
-            turns.append(self._row(idx,tn,ts,ns,m)); tn+=1
+            turns.append(self._row(idx,tn,ts,ns,m,conv_id)); tn+=1
         return turns
 
-    def _parse_ppt(self, text, idx):
+    def _parse_ppt(self, text, idx, conv_id: str = ""):
         hm=self._pph.findall(text)
-        if hm: return self._ppt_turns(hm,idx,False)
+        if hm: return self._ppt_turns(hm,idx,False,conv_id)
         sm=self._pps.findall(text)
-        if sm: return self._ppt_turns(sm,idx,True)
+        if sm: return self._ppt_turns(sm,idx,True,conv_id)
         return []
 
-    def _ppt_turns(self, matches, idx, is_sms):
+    def _ppt_turns(self, matches, idx, is_sms, conv_id: str = ""):
         spk_msgs={}; ordered=[]
         for ts,spk,msg in matches:
             sl=spk.strip().lower()
@@ -558,7 +635,7 @@ class ConversationProcessor:
                   else min(cnts,key=cnts.get))
             for s in ordered: roles[s]="CUSTOMER" if s==cust else "AGENT"
         all_m=sorted([(ts,s,m) for s in ordered for ts,m in spk_msgs[s]],key=lambda x:x[0])
-        return [self._row(idx,i,ts,roles.get(s,"CUSTOMER"),m) for i,(ts,s,m) in enumerate(all_m,1)]
+        return [self._row(idx,i,ts,roles.get(s,"CUSTOMER"),m,conv_id) for i,(ts,s,m) in enumerate(all_m,1)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
