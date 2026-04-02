@@ -993,17 +993,44 @@ def _cached_parse(checksum: str, fname: str, dataset_type: str,
     a short string rather than a potentially huge bytes object — preventing
     false cache hits when the internal hash truncates large files.
     """
-    # ── Polars read for CSV (fast); Excel falls back to pandas (no fastexcel needed) ──
+    # ── File reading — robust dtype handling ─────────────────────────────────
+    # Excel: always use pandas + openpyxl with dtype=str so every column
+    # (transcript text, IDs, timestamps) is read as a plain string.
+    # This prevents Polars schema inference from truncating rows, mistyping
+    # ISO timestamps as dates, or dropping multi-line cells.
+    # CSV: Polars read_csv with infer_schema_length=0 (all cols as Utf8).
     if fname.endswith(".csv"):
-        df_raw = pl.read_csv(io.BytesIO(file_bytes), infer_schema_length=0,
-                             null_values=["","NA","N/A","null","NULL","None"]).to_pandas()
+        df_raw = pl.read_csv(
+            io.BytesIO(file_bytes),
+            infer_schema_length=0,          # all columns read as strings
+            null_values=["","NA","N/A","null","NULL","None"],
+            truncate_ragged_lines=True,     # tolerate jagged rows
+        ).to_pandas()
     else:
-        # pl.read_excel requires the optional 'fastexcel' package which may not be
-        # installed — use pandas openpyxl engine as a safe universal fallback
-        try:
-            df_raw = pl.read_excel(io.BytesIO(file_bytes)).to_pandas()
-        except Exception:
-            df_raw = pd.read_excel(io.BytesIO(file_bytes))
+        # pandas + openpyxl is the most reliable Excel reader for:
+        #   • merged cells  • multi-line cells  • mixed-type columns
+        #   • UUID / long-string ID columns  • large files
+        # dtype=str prevents openpyxl from coercing timestamps or numbers.
+        # keep_default_na=False stops it turning "NA" strings into NaN.
+        df_raw = pd.read_excel(
+            io.BytesIO(file_bytes),
+            sheet_name=0,               # always read the first sheet
+            dtype=str,                  # every column as string — no type coercion
+            keep_default_na=False,      # preserve "NA", "null", etc. as strings
+            engine="openpyxl",
+        )
+        # Strip whitespace from all string columns to avoid hidden parse failures
+        for _c in df_raw.select_dtypes(include="object").columns:
+            df_raw[_c] = df_raw[_c].str.strip()
+    # ── Sanity check: warn if suspiciously few rows loaded ───────────────────
+    # Catches silent truncation from schema mismatches or wrong sheet.
+    if len(df_raw) < 2:
+        raise ValueError(
+            f"Only {len(df_raw)} row(s) were read from '{fname}'. "
+            "The file may be empty, on the wrong sheet, or in an unsupported format. "
+            "Check that data starts on row 1 with a header row."
+        )
+
     proc  = ConversationProcessor(dataset_type=dataset_type)
     df_p  = proc.parse(df_raw)
     df_p.attrs["detected_format"] = proc.detected_format
@@ -2448,7 +2475,7 @@ def render_sidebar():
                 gc.collect()
                 current_page = st.session_state.get("page", "📊 Overview")
                 for k in ("df_r","ins","detected","fname","pii_meta",
-                          "_file_checksum","_dataset_type","_pii_key","detected_domain_key"):
+                          "_file_checksum","_dataset_type","_pii_key","detected_domain_key","_pipeline_secs"):
                     st.session_state.pop(k, None)
                 # Stay on the current page (not Home)
                 st.session_state["page"] = current_page
@@ -2494,15 +2521,92 @@ def render_sidebar():
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE RENDERERS
 # ─────────────────────────────────────────────────────────────────────────────
-def _kpi_row(ins):
+def _compute_duration_str(df_r: pd.DataFrame) -> str:
+    """
+    Compute total conversation time span from the timestamp column.
+
+    Returns a human-readable string like "3h 24m" or "47m 12s".
+    Works with all 4 transcript formats — timestamps may be ISO strings,
+    HH:MM:SS strings, or MM:SS strings. Falls back to "—" gracefully.
+    """
+    ts_col = "timestamp"
+    if ts_col not in df_r.columns:
+        return "—"
+
+    raw = df_r[ts_col].dropna().astype(str)
+    raw = raw[raw.str.strip().str.len() > 3]
+    if raw.empty:
+        return "—"
+
+    parsed: List[pd.Timestamp] = []
+
+    for val in raw:
+        v = val.strip()
+        if not v or v in ("nan", "None", ""):
+            continue
+        try:
+            # Try pandas auto-parse first (handles ISO timestamps)
+            parsed.append(pd.to_datetime(v, infer_datetime_format=True, utc=True))
+            continue
+        except Exception:
+            pass
+        try:
+            # HH:MM:SS — treat as offset seconds from epoch
+            parts = v.split(":")
+            if len(parts) == 3:
+                secs = int(parts[0])*3600 + int(parts[1])*60 + float(parts[2])
+                parsed.append(pd.Timestamp(secs, unit="s", tz="UTC"))
+                continue
+        except Exception:
+            pass
+        try:
+            # MM:SS
+            parts = v.split(":")
+            if len(parts) == 2:
+                secs = int(parts[0])*60 + float(parts[1])
+                parsed.append(pd.Timestamp(secs, unit="s", tz="UTC"))
+        except Exception:
+            pass
+
+    if len(parsed) < 2:
+        return "—"
+
+    earliest = min(parsed)
+    latest   = max(parsed)
+    delta    = latest - earliest
+    total_s  = int(delta.total_seconds())
+
+    if total_s <= 0:
+        return "—"
+
+    days  = total_s // 86400
+    hours = (total_s % 86400) // 3600
+    mins  = (total_s % 3600) // 60
+    secs  = total_s % 60
+
+    if days > 0:
+        return f"{days}d {hours}h {mins}m"
+    if hours > 0:
+        return f"{hours}h {mins}m"
+    if mins > 0:
+        return f"{mins}m {secs}s"
+    return f"{secs}s"
+
+
+def _kpi_row(ins, df_r: pd.DataFrame = None):
     cs=ins["customer_satisfaction"]; ap=ins["agent_performance"]; cp=ins["conversation_patterns"]
     overall=ins["overall_sentiment"]["average"]
     esc_c=C['neg'] if cs["escalation_rate"]>0.15 else C['gold'] if cs["escalation_rate"]>0.10 else C['ok']
     res_c=C['ok']  if cs["resolution_rate"]>0.6  else C['gold'] if cs["resolution_rate"]>0.4  else C['neg']
-    cols=st.columns(8)
+
+    # Compute conversation duration from timestamps if df_r provided
+    dur_str = _compute_duration_str(df_r) if df_r is not None else "—"
+
+    cols=st.columns(9)
     data=[
         ("Conversations",  f"{ins['total_conversations']:,}",         "var(--teal)"),
         ("Total Turns",    f"{ins['total_turns']:,}",                  "var(--slate)"),
+        ("Conv Duration",  dur_str,                                    C["slate"]),
         ("Overall Sent.",  f"{overall:+.3f}",                          _score_color(overall)),
         ("Customer Avg",   f"{cs['average_sentiment']:+.3f}",          _score_color(cs["average_sentiment"])),
         ("Agent Avg",      f"{ap['average_sentiment']:+.3f}",          _score_color(ap["average_sentiment"])),
@@ -3666,10 +3770,12 @@ def main():
 
             pb = st.progress(0, text="Starting pipeline…")
             try:
+                _t0 = datetime.now()
                 df_r, ins, detected, pii_meta = run_pipeline(
                     file_bytes, uploaded.name, dataset_type, progress_bar=pb,
                     pii_enabled=pii_enabled, pii_mode=pii_mode,
                 )
+                _pipeline_secs = (datetime.now() - _t0).total_seconds()
                 pb.empty()
                 # Map the human-readable detected label back to a domain key
                 # so the sidebar selectbox can sync to it automatically.
@@ -3684,6 +3790,7 @@ def main():
                     "_dataset_type":     dataset_type,
                     "_pii_key":          pii_key,
                     "detected_domain_key": _detected_key,
+                    "_pipeline_secs":    _pipeline_secs,
                 })
                 if st.session_state.get("page") in ("🏠 Home", "📊 Overview"):
                     st.session_state["page"] = "📊 Overview"
@@ -3722,6 +3829,20 @@ def main():
     fname    = st.session_state.get("fname", "")
     pii_meta = st.session_state.get("pii_meta", {"enabled": False, "mode": "off", "redacted_rows": 0})
 
+    # Pipeline timing
+    _pipeline_secs = st.session_state.get("_pipeline_secs")
+    if _pipeline_secs is not None:
+        _ps = int(_pipeline_secs)
+        _timing_str = f"{_ps//60}m {_ps%60}s" if _ps >= 60 else f"{_pipeline_secs:.1f}s"
+        _timing_badge = (
+            f' &nbsp;·&nbsp; <span style="background:rgba(45,95,110,0.08);'
+            f'border:1px solid {C["border"]};border-radius:4px;padding:1px 7px;'
+            f'font-size:11px;color:{C["muted"]};font-weight:500">'
+            f'⏱️ Analysed in {_timing_str}</span>'
+        )
+    else:
+        _timing_badge = ""
+
     # Status bar
     ca, cb_col, cc = st.columns([3, 2, 1])
     with ca:
@@ -3739,7 +3860,7 @@ def main():
             f'<div style="color:{C["muted"]};font-size:.82rem">'
             f'📂 {fname} &nbsp;·&nbsp; '
             f'Format: <strong style="color:{C["teal"]}">{detected}</strong>'
-            f'{pii_badge}</div>',
+            f'{pii_badge}{_timing_badge}</div>',
             unsafe_allow_html=True,
         )
     with cc:
@@ -3752,7 +3873,7 @@ def main():
         )
 
     st.markdown("---")
-    _kpi_row(ins)
+    _kpi_row(ins, df_r=df_r)
     st.markdown("---")
 
     if   page == "📊 Overview":           page_overview(df_r, ins)
