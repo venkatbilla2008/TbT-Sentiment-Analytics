@@ -2767,12 +2767,10 @@ def page_sankey(df_r, ins):
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ── Tab layout — one tab per Sankey ───────────────────────────────────────
-    tab1, tab2, tab3, tab4 = st.tabs([
+    # ── Tab layout — 2 Sankey tabs ─────────────────────────────────────────────
+    tab1, tab2 = st.tabs([
         "🌊 Phase Flow",
         "🔀 Turn Transitions",
-        "👥 Speaker Journey",
-        "🎯 Start → End",
     ])
 
     with tab1:
@@ -2784,152 +2782,58 @@ def page_sankey(df_r, ins):
             f'Band width = number of conversations carrying that sentiment into the next phase.</div>',
             unsafe_allow_html=True,
         )
-        st.plotly_chart(
-            _chart_sankey_phase_flow(aggs),
-            width="stretch",
-        )
+        st.plotly_chart(_chart_sankey_phase_flow(aggs), width="stretch")
 
     with tab2:
         st.markdown(
             f'<div style="background:{C["warm_l"]};border-left:3px solid {C["teal"]};'
             f'border-radius:6px;padding:8px 14px;font-size:12px;color:{C["text2"]};margin-bottom:10px">'
-            f'📖 <strong>How to read:</strong> Left side = sentiment of the current turn. '
-            f'Right side = sentiment of the very next turn in the same conversation. '
+            f'📖 <strong>How to read:</strong> Left = sentiment of the current turn. '
+            f'Right = sentiment of the very next turn in the same conversation. '
             f'Band width = number of turn-level transitions. '
             f'A thick band from Positive(from) → Negative(to) means sentiment drops sharply between turns.</div>',
             unsafe_allow_html=True,
         )
         spk_col, _ = st.columns([1, 3])
         with spk_col:
-            spk_filter = st.selectbox(
-                "Filter by speaker",
-                ["ALL", "CUSTOMER", "AGENT"],
-                key="sankey_spk",
-            )
-        st.plotly_chart(
-            _chart_sankey_turn_transitions(aggs, spk_filter),
-            width="stretch",
-        )
+            spk_filter = st.selectbox("Filter by speaker", ["ALL","CUSTOMER","AGENT"], key="sankey_spk")
+        st.plotly_chart(_chart_sankey_turn_transitions(aggs, spk_filter), width="stretch")
 
         # Transition matrix table
         tf = aggs["turn_flow"].copy()
         if spk_filter != "ALL":
             tf = tf[tf["speaker"] == spk_filter]
-        tf = tf.groupby(["source", "target"], as_index=False)["count"].sum()
+        tf = tf.groupby(["source","target"], as_index=False)["count"].sum()
         tf = tf.sort_values("count", ascending=False)
         if not tf.empty:
             st.markdown(
                 f'<div class="sh" style="margin-top:16px">📋 Transition Matrix '
-                f'<span style="font-size:11px;color:{C["muted"]};font-weight:400"> — '
-                f'sorted by volume</span></div>',
+                f'<span style="font-size:11px;color:{C["muted"]};font-weight:400"> — sorted by volume</span></div>',
                 unsafe_allow_html=True,
             )
             tf["movement"] = tf["source"].str.capitalize() + " → " + tf["target"].str.capitalize()
             tf["pct"] = (tf["count"] / tf["count"].sum() * 100).round(1).astype(str) + "%"
-            # Colour-code based on movement type
             def _mv_badge(row):
                 s, t = row["source"].lower(), row["target"].lower()
-                if s == t:    return f'<span class="badge b-info">↔ Stable</span>'
-                pos_s = ["positive"]; neg_s = ["negative"]
-                if s in neg_s and t in pos_s:   return f'<span class="badge b-ok">↑ Recovery</span>'
-                if s in pos_s and t in neg_s:   return f'<span class="badge b-err">↓ Decline</span>'
-                if t == "neutral":               return f'<span class="badge b-warn">→ Neutral</span>'
+                if s == t:                              return f'<span class="badge b-info">↔ Stable</span>'
+                if s == "negative" and t == "positive": return f'<span class="badge b-ok">↑ Recovery</span>'
+                if s == "positive" and t == "negative": return f'<span class="badge b-err">↓ Decline</span>'
+                if t == "neutral":                      return f'<span class="badge b-warn">→ Neutral</span>'
                 return f'<span class="badge b-info">→ Shift</span>'
             tf["type"] = tf.apply(_mv_badge, axis=1)
-            rows_html = ""
-            for _, r in tf.iterrows():
-                rows_html += (
-                    f"<tr><td>{r['movement']}</td>"
-                    f"<td style='text-align:right;font-family:monospace'>{int(r['count']):,}</td>"
-                    f"<td style='text-align:right'>{r['pct']}</td>"
-                    f"<td>{r['type']}</td></tr>"
-                )
+            rows_html = "".join(
+                f"<tr><td>{r['movement']}</td>"
+                f"<td style='text-align:right;font-family:monospace'>{int(r['count']):,}</td>"
+                f"<td style='text-align:right'>{r['pct']}</td>"
+                f"<td>{r['type']}</td></tr>"
+                for _, r in tf.iterrows()
+            )
             st.markdown(
                 f"<table class='pt'><thead><tr>"
                 f"<th>Transition</th><th>Count</th><th>Share</th><th>Type</th>"
                 f"</tr></thead><tbody>{rows_html}</tbody></table>",
                 unsafe_allow_html=True,
             )
-
-    with tab3:
-        st.markdown(
-            f'<div style="background:{C["warm_l"]};border-left:3px solid {C["teal"]};'
-            f'border-radius:6px;padding:8px 14px;font-size:12px;color:{C["text2"]};margin-bottom:12px">'
-            f'📖 <strong>How to read:</strong> Left = Speaker. Middle = Speaker × Phase. '
-            f'Right = final Sentiment. Trace a band from CUSTOMER → Start → Negative '
-            f'to see how many customer turns in the Start phase were negative.</div>',
-            unsafe_allow_html=True,
-        )
-        st.plotly_chart(
-            _chart_sankey_speaker_journey(aggs),
-            width="stretch",
-        )
-
-    with tab4:
-        st.markdown(
-            f'<div style="background:{C["warm_l"]};border-left:3px solid {C["teal"]};'
-            f'border-radius:6px;padding:8px 14px;font-size:12px;color:{C["text2"]};margin-bottom:12px">'
-            f'📖 <strong>How to read:</strong> Left = sentiment at the start of the conversation. '
-            f'Right = sentiment at the end. The key band to watch is '
-            f'<strong>Start Positive → End Negative</strong> — those are conversations that deteriorated. '
-            f'<strong>Start Negative → End Positive</strong> = successful recoveries.</div>',
-            unsafe_allow_html=True,
-        )
-        st.plotly_chart(
-            _chart_sankey_start_to_end(aggs),
-            width="stretch",
-        )
-
-        # Highlight key business findings
-        se = aggs["se_flow"].copy()
-        se = se[se["count"] > 0]
-        total_convs = se["count"].sum()
-        if total_convs > 0:
-            # Deteriorated: pos→neg
-            det = se[(se["source"]=="positive") & (se["target"]=="negative")]["count"].sum()
-            # Recovered:   neg→pos
-            rec = se[(se["source"]=="negative") & (se["target"]=="positive")]["count"].sum()
-            # Stable pos:  pos→pos
-            stp = se[(se["source"]=="positive") & (se["target"]=="positive")]["count"].sum()
-            # Stable neg:  neg→neg
-            stn = se[(se["source"]=="negative") & (se["target"]=="negative")]["count"].sum()
-
-            st.markdown("---")
-            sh("💡", "Key Business Findings")
-            f1, f2, f3, f4 = st.columns(4)
-            with f1:
-                st.markdown(mc("😊 Stayed Positive",  f"{int(stp):,}",
-                               C["pos"]), unsafe_allow_html=True)
-            with f2:
-                st.markdown(mc("📉 Deteriorated",     f"{int(det):,}",
-                               C["neg"]), unsafe_allow_html=True)
-            with f3:
-                st.markdown(mc("📈 Recovered",        f"{int(rec):,}",
-                               C["ok"]), unsafe_allow_html=True)
-            with f4:
-                st.markdown(mc("😞 Stayed Negative",  f"{int(stn):,}",
-                               C["err"] if hasattr(C,"err") else C["neg"]),
-                            unsafe_allow_html=True)
-
-            if det > 0:
-                det_pct = det / total_convs
-                st.markdown(
-                    f'<div class="rc" style="border-left:3px solid {C["neg"]};margin-top:10px">'
-                    f'⚠️ <strong>{det_pct:.1%} of conversations deteriorated</strong> '
-                    f'(started positive, ended negative) — '
-                    f'{"Critical: review agent scripts & de-escalation training." if det_pct > 0.15 else "Monitor closely."}'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-            if rec > 0:
-                rec_pct = rec / total_convs
-                st.markdown(
-                    f'<div class="rc" style="border-left:3px solid {C["pos"]};margin-top:6px">'
-                    f'✅ <strong>{rec_pct:.1%} of conversations recovered</strong> '
-                    f'(started negative, ended positive) — agents are resolving issues effectively.</div>',
-                    unsafe_allow_html=True,
-                )
-
 
 # ─── Overview ─────────────────────────────────────────────────────────────────
 def page_overview(df_r, ins):
@@ -2949,12 +2853,8 @@ def page_overview(df_r, ins):
         sh("🎯", "Start → End Sentiment")
         st.plotly_chart(_chart_sankey_start_to_end(aggs), width="stretch")
 
-    # ── 3. Sentiment progression by turn ─────────────────────────────────────
-    sh("📉", "Avg Sentiment by Turn  (first 30 turns)")
-    st.plotly_chart(_chart_sentiment_progression(aggs), width="stretch")
-
-    # ── 4. Top escalation triggers ───────────────────────────────────────────
-    sh("⚠️", "Top Escalation Triggers")
+    # ── 3. Top escalation trigger phrases ────────────────────────────────────
+    sh("⚠️", "Top Escalation Trigger Phrases")
     _escalation_triggers_table(df_r, top_n=15)
 
 # ─── Explorer (merged TbT Flow + turn viewer + comparison) ──────────────────
@@ -3105,7 +3005,12 @@ def _compute_escalation_intel(df: pd.DataFrame) -> dict:
     n_resolved   = int(len(set(res_df["conversation_id"]) & esc_conv_ids))
     n_unresolved = n_escalated - n_resolved
 
-    # ── 2. Trigger words + bigrams ────────────────────────────────────────────
+    # ── 2. Phrase-level trigger analysis (filtered, not raw frequency) ────────
+    # Strategy:
+    #   1. Extract bigrams AND trigrams from escalation turns
+    #   2. Filter: only phrases appearing in >= 2 distinct conversations (removes noise)
+    #   3. Rank by CONVERSATION COVERAGE (not raw count) — more meaningful for management
+    #   4. Cluster into semantic themes: billing/payment, wait time, agent issues, etc.
     STOPWORDS = {
         "i","the","a","an","and","or","but","in","on","at","to","for","of","is",
         "was","are","were","be","been","have","has","had","do","did","not","no",
@@ -3113,39 +3018,80 @@ def _compute_escalation_intel(df: pd.DataFrame) -> dict:
         "up","can","will","just","don","t","s","re","ve","ll","get","got","its",
         "our","he","she","them","their","about","when","what","how","why","all",
         "would","could","should","there","than","then","from","also","more","very",
+        "said","say","know","want","need","like","think","going","come","back",
+        "yes","okay","ok","right","sure","well","still","now","time","again",
     }
-    word_counts: Dict[str, int] = {}
-    bigram_counts: Dict[str, int] = {}
-    conv_word:   Dict[str, set]   = {}
+    # Phrase → set of conv_ids that contain it
+    phrase_convs: Dict[str, set] = {}
+    phrase_count: Dict[str, int] = {}
 
     for _, row in esc_df.iterrows():
         cid   = str(row.get("conversation_id", ""))
         msg   = str(row.get("message", "")).lower()
         words = [w for w in _re.findall(r"[a-z]{3,}", msg) if w not in STOPWORDS]
-        for w in words:
-            word_counts[w] = word_counts.get(w, 0) + 1
-            conv_word.setdefault(w, set()).add(cid)
-        # bigrams
-        for i in range(len(words) - 1):
-            bg = f"{words[i]} {words[i+1]}"
-            bigram_counts[bg] = bigram_counts.get(bg, 0) + 1
+        # Build bigrams and trigrams
+        for n_gram in (2, 3):
+            for i in range(len(words) - n_gram + 1):
+                phrase = " ".join(words[i:i+n_gram])
+                phrase_count[phrase] = phrase_count.get(phrase, 0) + 1
+                phrase_convs.setdefault(phrase, set()).add(cid)
 
-    top_bigrams = sorted(bigram_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-    top_words   = sorted(word_counts.items(),   key=lambda x: x[1], reverse=True)[:20]
+    # Filter: must appear in >= 2 conversations (noise guard)
+    # Rank by conversation coverage (unique convs), then by count
+    qualified = [
+        {
+            "phrase":    phrase,
+            "count":     cnt,
+            "convs":     len(phrase_convs[phrase]),
+            "conv_pct":  len(phrase_convs[phrase]) / max(n_escalated, 1),
+            "is_bigram": len(phrase.split()) == 2,
+        }
+        for phrase, cnt in phrase_count.items()
+        if len(phrase_convs[phrase]) >= 2   # min 2 conversations
+    ]
+    # Sort: conv_coverage DESC, then count DESC
+    trigger_rows = sorted(qualified, key=lambda x: (x["convs"], x["count"]), reverse=True)[:30]
 
-    # Merge words + bigrams into one ranked list
-    combined: List[Dict] = []
-    for bg, cnt in top_bigrams:
-        # conv coverage: any conv that has both words
-        w1, w2 = bg.split()
-        cvs = conv_word.get(w1, set()) & conv_word.get(w2, set())
-        combined.append({"phrase": bg, "count": cnt, "convs": len(cvs),
-                         "conv_pct": len(cvs) / max(n_escalated, 1), "is_bigram": True})
-    for w, cnt in top_words:
-        combined.append({"phrase": w, "count": cnt, "convs": len(conv_word.get(w, set())),
-                         "conv_pct": len(conv_word.get(w, set())) / max(n_escalated, 1),
-                         "is_bigram": False})
-    trigger_rows = sorted(combined, key=lambda x: x["count"], reverse=True)[:25]
+    # ── Semantic clustering of top phrases ────────────────────────────────────
+    # Assign each phrase to a business theme based on keyword matching.
+    # Themes are ordered by business priority.
+    CLUSTER_RULES: List[tuple] = [
+        ("Billing / Payment",    ["bill","payment","charge","refund","fee","price","cost","money","paid","invoice","credit","debit"]),
+        ("Wait Time / Delays",   ["wait","waiting","hold","long","hours","days","slow","delay","delayed","response","still","week"]),
+        ("Agent / Service",      ["agent","representative","rude","help","helpful","spoke","told","promised","manager","supervisor","transfer"]),
+        ("Account / Access",     ["account","login","password","access","locked","reset","email","username","profile","verify"]),
+        ("Product / Service",    ["product","service","cancel","subscription","plan","upgrade","downgrade","feature","broken","issue","problem","error","bug"]),
+        ("Delivery / Order",     ["order","delivery","shipping","package","arrived","missing","lost","track","tracking","return","refund"]),
+        ("Repeat Contact",       ["again","third","second","already","before","previous","last time","called before","told me"]),
+        ("Dissatisfaction",      ["terrible","horrible","awful","worst","disappointed","never","unacceptable","ridiculous","disgrace","useless"]),
+    ]
+
+    def _assign_cluster(phrase: str) -> str:
+        pl = phrase.lower()
+        for cluster, keywords in CLUSTER_RULES:
+            if any(kw in pl for kw in keywords):
+                return cluster
+        return "Other"
+
+    for r in trigger_rows:
+        r["cluster"] = _assign_cluster(r["phrase"])
+
+    # ── Cluster summary: group trigger_rows by cluster, aggregate ─────────────
+    cluster_agg: Dict[str, Dict] = {}
+    for r in trigger_rows:
+        cl = r["cluster"]
+        if cl not in cluster_agg:
+            cluster_agg[cl] = {"cluster": cl, "total_convs": 0, "total_count": 0,
+                                "top_phrase": r["phrase"], "phrases": []}
+        cluster_agg[cl]["total_convs"]  = max(cluster_agg[cl]["total_convs"], r["convs"])
+        cluster_agg[cl]["total_count"] += r["count"]
+        cluster_agg[cl]["phrases"].append(r["phrase"])
+    cluster_summary = sorted(
+        cluster_agg.values(),
+        key=lambda x: x["total_convs"], reverse=True
+    )
+    for c in cluster_summary:
+        c["conv_pct"] = c["total_convs"] / max(n_escalated, 1)
 
     # ── 3. Escalation by phase ────────────────────────────────────────────────
     esc_phase = (
@@ -3358,6 +3304,7 @@ def _compute_escalation_intel(df: pd.DataFrame) -> dict:
         "recovery_intel":     recovery_intel,
         "deteriorated":       deteriorated,
         "top_escalated":      top_esc_convs if not top_esc_convs.empty else pd.DataFrame(),
+        "cluster_summary":    cluster_summary,
         "avg_agent_response": avg_agent_response,
         "total_convs":        total_convs,
         "n_escalated":        n_escalated,
@@ -3367,39 +3314,42 @@ def _compute_escalation_intel(df: pd.DataFrame) -> dict:
     }
 
 def _escalation_triggers_table(df_r: pd.DataFrame, top_n: int = 15):
-    """Render escalation trigger word table — used in Overview and Escalation page."""
-    intel = _compute_escalation_intel(df_r)
-    rows  = intel["trigger_rows"][:top_n]
-    if not rows:
+    """Overview snippet: top phrase clusters — concise version for the Overview page."""
+    intel    = _compute_escalation_intel(df_r)
+    clusters = intel.get("cluster_summary", [])
+    if not clusters:
         st.info("No escalation turns detected in this dataset.")
         return
+    rows = intel["trigger_rows"][:top_n]
     total_esc = intel["n_escalated"]
+    # Show cluster summary + top phrases in a compact table
     html_rows = ""
-    for r in rows:
-        bar_w = int(r["conv_pct"] * 100)
+    for i, c in enumerate(clusters[:6]):   # top 6 clusters in Overview
+        bar_w    = int(c["conv_pct"] * 100)
         bar_html = (
             f'<div style="display:flex;align-items:center;gap:6px">'
             f'<div style="flex:1;background:{C["warm"]};border-radius:4px;height:7px;overflow:hidden">'
             f'<div style="width:{bar_w}%;height:100%;background:{C["neg"]};border-radius:4px"></div>'
-            f'</div>'
-            f'<span style="font-size:11px;color:{C["muted"]};width:36px;text-align:right">'
-            f'{r["conv_pct"]:.0%}</span></div>'
+            f'</div><span style="font-size:11px;color:{C["muted"]};width:36px;text-align:right">'
+            f'{c["conv_pct"]:.0%}</span></div>'
         )
+        sample = ", ".join(c["phrases"][:3])
         html_rows += (
             f"<tr>"
-            f"<td><strong>{r['phrase']}</strong></td>"
-            f"<td style='text-align:right;font-family:monospace'>{r['count']:,}</td>"
-            f"<td style='text-align:right;font-family:monospace'>{r['convs']:,} / {total_esc:,}</td>"
+            f"<td><strong>{c['cluster']}</strong><br>"
+            f"<span style='font-size:11px;color:{C['muted']}'><em>{sample}</em></span></td>"
+            f"<td style='text-align:right;font-weight:600;color:{C['neg']}'>{c['total_convs']:,} / {total_esc:,}</td>"
             f"<td style='min-width:140px'>{bar_html}</td>"
             f"</tr>"
         )
     st.markdown(
         f"<table class='pt'><thead><tr>"
-        f"<th>Trigger Word</th><th>Occurrences</th>"
-        f"<th>Escalated Conversations</th><th>% of Escalated Convs</th>"
+        f"<th>Cluster Theme  <span style='font-weight:400;font-size:11px'>(sample phrases)</span></th>"
+        f"<th>Escalated Convs</th><th>Coverage</th>"
         f"</tr></thead><tbody>{html_rows}</tbody></table>",
         unsafe_allow_html=True,
     )
+    st.caption("See ⚠️ Escalation page for full cluster analysis and filtered phrase detail.")
 
 
 # ─── Escalation Page ──────────────────────────────────────────────────────────
@@ -3592,89 +3542,105 @@ def page_escalation(df_r, ins):
         )
 
     # ─────────────────────────────────────────────────────────────────────────
-    # ROW 3 — Escalation reasons (trigger phrases bar chart)
+    # ROW 3 — Escalation Pattern Clusters  (semantic grouping)
     # ─────────────────────────────────────────────────────────────────────────
-    sh("🔑", "Escalation Reasons  — Top Trigger Phrases")
-    st.caption("Single words and bigrams most frequently present in escalation turns. Bigrams (phrase pairs) highlighted.")
-    rows = intel["trigger_rows"][:20]
-    if rows:
-        tr_df = pd.DataFrame(rows)
-        tr_df["label"] = tr_df.apply(
-            lambda r: f"「{r['phrase']}」" if r["is_bigram"] else r["phrase"], axis=1
-        )
-        tr_df["color"] = tr_df["is_bigram"].map({True: C["neg"], False: C["warn"]})
-        tr_df = tr_df.sort_values("count")  # ascending for horizontal bar readability
-
-        fig_tr = go.Figure(go.Bar(
-            x=tr_df["count"], y=tr_df["label"],
-            orientation="h",
-            marker_color=tr_df["color"].tolist(),
-            marker_line_width=0,
-            text=tr_df["count"].astype(int),
-            textposition="outside",
-            customdata=tr_df["conv_pct"].values,
-            hovertemplate="<b>%{y}</b><br>Occurrences: %{x:,}<br>In %{customdata:.0%} of escalated convs<extra></extra>",
-        ))
-        fig_tr.update_layout(
-            height=max(320, len(rows) * 26),
-            margin=dict(l=10, r=60, t=10, b=10),
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(family="DM Sans", color=C["text"]),
-            xaxis=dict(title="Occurrences in Escalation Turns"),
-            yaxis=dict(title=""),
-        )
-        # Legend annotation
-        fig_tr.add_annotation(
-            text="🟠 Single word  🔴 Bigram phrase",
-            xref="paper", yref="paper", x=1.0, y=-0.05,
-            showarrow=False, font=dict(size=10, color=C["muted"]),
-            xanchor="right",
-        )
-        st.plotly_chart(fig_tr, width="stretch")
-    else:
-        st.info("No escalation turn data found.")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # ROW 4 — Top escalated conversations table
-    # ─────────────────────────────────────────────────────────────────────────
-    sh("📋", "Top Escalated Conversations")
-    st.caption("Ranked by escalation event count. Severity = function of event count × end sentiment.")
-    te = intel["top_escalated"]
-    if not te.empty:
-        SEV_BADGE = {
-            "Low":    f'<span class="badge b-info">Low</span>',
-            "Medium": f'<span class="badge b-warn">Medium</span>',
-            "High":   f'<span class="badge b-err">High</span>',
-            "Severe": f'<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:5px;font-size:11px;font-weight:600;background:#3D0000;color:#FF8080">🔴 Severe</span>',
-        }
-        def _sent_badge(v):
-            if v >= 0.1:  return f'<span class="badge b-ok">{v:+.3f}</span>'
-            if v >= -0.1: return f'<span class="badge b-warn">{v:+.3f}</span>'
-            return         f'<span class="badge b-err">{v:+.3f}</span>'
-
-        rows_html = ""
-        for _, r in te.iterrows():
-            sev_badge = SEV_BADGE.get(str(r.get("severity","Low")), SEV_BADGE["Low"])
-            rows_html += (
+    sh("🧩", "Escalation Pattern Clusters")
+    st.caption(
+        "Phrases from escalation turns grouped into business themes. "
+        "Ranked by how many escalated conversations each cluster appears in. "
+        "More actionable than raw word frequency — shows the real root causes."
+    )
+    clusters = intel.get("cluster_summary", [])
+    if clusters:
+        # ── Cluster summary table ─────────────────────────────────────────────
+        cl_rows = ""
+        for i, c in enumerate(clusters):
+            rank_badge = (
+                f'<span style="display:inline-flex;align-items:center;justify-content:center;'
+                f'width:22px;height:22px;border-radius:50%;background:{C["neg"] if i==0 else C["warn"] if i<=2 else C["slate"]};'
+                f'color:#fff;font-size:11px;font-weight:700">#{i+1}</span>'
+            )
+            bar_w = int(c["conv_pct"] * 100)
+            bar_html = (
+                f'<div style="display:flex;align-items:center;gap:6px">'
+                f'<div style="flex:1;background:{C["warm"]};border-radius:4px;height:7px;overflow:hidden">'
+                f'<div style="width:{bar_w}%;height:100%;background:{C["neg"]};border-radius:4px"></div></div>'
+                f'<span style="font-size:11px;color:{C["muted"]};width:36px;text-align:right">{c["conv_pct"]:.0%}</span></div>'
+            )
+            # Top 3 sample phrases
+            sample = " · ".join([f"<em>{p}</em>" for p in c["phrases"][:3]])
+            cl_rows += (
                 f"<tr>"
-                f"<td><strong>{r['conversation_id']}</strong></td>"
-                f"<td style='text-align:center'><strong style='color:{C['neg']}'>{int(r['esc_events'])}</strong></td>"
-                f"<td style='text-align:center'>{sev_badge}</td>"
-                f"<td style='text-align:right'>{_sent_badge(float(r['cust_avg']))}</td>"
-                f"<td style='text-align:right;font-family:monospace'>{int(r['turn_count'])}</td>"
+                f"<td>{rank_badge}</td>"
+                f"<td><strong>{c['cluster']}</strong><br>"
+                f"<span style='font-size:11px;color:{C['muted']}'>{sample}</span></td>"
+                f"<td style='text-align:right;font-weight:700;color:{C['neg']}'>{c['total_convs']:,}</td>"
+                f"<td style='text-align:right'>{c['total_count']:,}</td>"
+                f"<td style='min-width:140px'>{bar_html}</td>"
                 f"</tr>"
             )
         st.markdown(
             f"<table class='pt'><thead><tr>"
-            f"<th>Conversation ID</th><th>Esc Events</th><th>Severity</th>"
-            f"<th>Cust Avg Sentiment</th><th>Total Turns</th>"
-            f"</tr></thead><tbody>{rows_html}</tbody></table>",
+            f"<th>#</th><th>Cluster Theme  <span style='font-weight:400;color:var(--muted)'>"
+            f"(sample phrases)</span></th>"
+            f"<th>Escalated Convs</th><th>Phrase Hits</th><th>% of Escalated Convs</th>"
+            f"</tr></thead><tbody>{cl_rows}</tbody></table>",
             unsafe_allow_html=True,
         )
-        st.caption("Open any conversation in the 🗣️ Explorer page for turn-by-turn detail.")
-    else:
-        st.info("No escalated conversations found.")
+        st.markdown("<br>", unsafe_allow_html=True)
 
+        # ── Top filtered phrases bar chart ────────────────────────────────────
+        sh("🔑", "Top Trigger Phrases  — filtered & ranked by conversation coverage")
+        st.caption(
+            "Bigrams and trigrams that appear in ≥ 2 distinct escalated conversations. "
+            "Ranked by how many conversations they appear in — not raw frequency. "
+            "Coloured by cluster theme."
+        )
+        rows = intel["trigger_rows"][:20]
+        if rows:
+            CLUSTER_COLORS = {
+                "Billing / Payment":   "#A04040",
+                "Wait Time / Delays":  "#B8963E",
+                "Agent / Service":     "#2D5F6E",
+                "Account / Access":    "#3D7A5F",
+                "Product / Service":   "#6B4A8C",
+                "Delivery / Order":    "#4682b4",
+                "Repeat Contact":      "#C0603C",
+                "Dissatisfaction":     "#8B0000",
+                "Other":               C["slate"],
+            }
+            tr_df = pd.DataFrame(rows)
+            tr_df["color"] = tr_df["cluster"].map(CLUSTER_COLORS).fillna(C["slate"])
+            tr_df["label"] = tr_df["phrase"]
+            tr_df = tr_df.sort_values("convs")  # ascending for readability
+
+            fig_tr = go.Figure(go.Bar(
+                x=tr_df["convs"], y=tr_df["label"],
+                orientation="h",
+                marker_color=tr_df["color"].tolist(),
+                marker_line_width=0,
+                text=tr_df["convs"].astype(int),
+                textposition="outside",
+                customdata=tr_df[["count","conv_pct","cluster"]].values,
+                hovertemplate=(
+                    "<b>%{y}</b><br>"
+                    "Escalated conversations: %{x:,}<br>"
+                    "Total occurrences: %{customdata[0]:,.0f}<br>"
+                    "Conv coverage: %{customdata[1]:.0%}<br>"
+                    "Cluster: %{customdata[2]}<extra></extra>"
+                ),
+            ))
+            fig_tr.update_layout(
+                height=max(320, len(rows) * 26),
+                margin=dict(l=10, r=60, t=10, b=10),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(family="DM Sans", color=C["text"]),
+                xaxis=dict(title="Distinct Escalated Conversations"),
+                yaxis=dict(title=""),
+            )
+            st.plotly_chart(fig_tr, width="stretch")
+    else:
+        st.info("No escalation phrase data found.")
     # ─────────────────────────────────────────────────────────────────────────
     # ROW 5 — Top deteriorated conversations table
     # ─────────────────────────────────────────────────────────────────────────
