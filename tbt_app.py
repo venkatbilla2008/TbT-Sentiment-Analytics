@@ -374,15 +374,15 @@ class ConversationProcessor:
     ]
     def __init__(self, dataset_type: str = "auto"):
         self.dataset_type = dataset_type.lower()
-        self._pt  = re.compile(r"^\|?\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+[+-]\d{4})\s+(Consumer|Customer|Agent|Advisor|Support):\s*(.*)$", re.I)
-        self._pb  = re.compile(r"^\[(\d{1,2}:\d{2}:\d{2})\s+(AGENT|CUSTOMER|CONSUMER|ADVISOR|SUPPORT)\]:\s*(.*)$", re.I)
-        self._ph  = re.compile(r"\[(\d{1,3}:\d{2})\]\s+([^:]+?):\s*([^\[]+?)(?=\[|$)", re.I|re.DOTALL)
+        self._pt  = re.compile(r"^\|?\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+[+-]\d{4})\s+(Consumer|Customer|Agent|Advisor|Support):\s*(.*)$", re.I|re.MULTILINE)
+        self._pb  = re.compile(r"^\[(\d{1,2}:\d{2}:\d{2})\s+(AGENT|CUSTOMER|CONSUMER|ADVISOR|SUPPORT)\]:\s*(.*)$", re.I|re.MULTILINE)
+        self._ph  = re.compile(r"\[(\d{1,3}:\d{2})\]\s+([^:]+?):\s*([^\[]+?)(?=\[|$)", re.I|re.DOTALL|re.MULTILINE)
         self._pph = re.compile(r"<b>(\d{2}:\d{2}:\d{2})\s+([^:]+?)\s*:\s*</b>([^<]+?)(?:<br\s*/?>|$)", re.I|re.DOTALL)
         self._pps = re.compile(
             r"(?<!\d{4}-\d{2}-\d{2} )"   # NOT preceded by ISO date (avoids stealing Spotify rows)
             r"(\d{2}:\d{2}:\d{2})"        # HH:MM:SS timestamp
             r"\s+([^:]+?)\s*:\s*(.+?)(?=\d{2}:\d{2}:\d{2}\s+|$)",
-            re.DOTALL
+            re.DOTALL|re.MULTILINE
         )
 
     # Known column names that hold a conversation / session identifier
@@ -2627,30 +2627,65 @@ def _compute_duration_str(df_r: pd.DataFrame) -> str:
     return f"~{avg_str} avg  ({total_str} total)"
 
 
-def _kpi_row(ins, df_r: pd.DataFrame = None):
-    cs=ins["customer_satisfaction"]; ap=ins["agent_performance"]; cp=ins["conversation_patterns"]
-    overall=ins["overall_sentiment"]["average"]
-    esc_c=C['neg'] if cs["escalation_rate"]>0.15 else C['gold'] if cs["escalation_rate"]>0.10 else C['ok']
-    res_c=C['ok']  if cs["resolution_rate"]>0.6  else C['gold'] if cs["resolution_rate"]>0.4  else C['neg']
+def _kpi_row(ins, df_r: pd.DataFrame = None, pipeline_secs: float = None):
+    """
+    KPI strip — uses st.metric() cards (same pattern as reference NLP app).
 
-    # Compute conversation duration from timestamps if df_r provided
-    dur_str = _compute_duration_str(df_r) if df_r is not None else "—"
+    Cards:
+      Conversations · Total Turns · Processing Time · Speed ·
+      Overall Sent. · Customer Avg · Agent Avg · Escalation · Resolution · Trend
+    """
+    cs      = ins["customer_satisfaction"]
+    ap      = ins["agent_performance"]
+    cp      = ins["conversation_patterns"]
+    overall = ins["overall_sentiment"]["average"]
+    total_t = ins["total_turns"]
 
-    cols=st.columns(9)
-    data=[
-        ("Conversations",  f"{ins['total_conversations']:,}",         "var(--teal)"),
-        ("Total Turns",    f"{ins['total_turns']:,}",                  "var(--slate)"),
-        ("Duration",       dur_str,                                    C["slate"]),
-        ("Overall Sent.",  f"{overall:+.3f}",                          _score_color(overall)),
-        ("Customer Avg",   f"{cs['average_sentiment']:+.3f}",          _score_color(cs["average_sentiment"])),
-        ("Agent Avg",      f"{ap['average_sentiment']:+.3f}",          _score_color(ap["average_sentiment"])),
-        ("Escalation",     _pct(cs["escalation_rate"]),                esc_c),
-        ("Resolution",     _pct(cs["resolution_rate"]),                res_c),
-        ("Trend",          f"{cp['sentiment_improvement']:+.3f}",      _score_color(cp["sentiment_improvement"])),
-    ]
-    for col,(lbl,val,color) in zip(cols,data):
-        with col: st.markdown(mc(lbl,f'<span style="color:{color}">{val}</span>',color),
-                               unsafe_allow_html=True)
+    # Processing Time + Speed  (from pipeline wall-clock, same as reference app)
+    if pipeline_secs and pipeline_secs > 0:
+        ps = int(pipeline_secs)
+        pt_str    = f"{ps//60}m {ps%60}s" if ps >= 60 else f"{pipeline_secs:.1f}s"
+        speed_str = f"{total_t / pipeline_secs:.1f} turns/s"
+    else:
+        pt_str    = "—"
+        speed_str = "—"
+
+    # Sentiment delta indicators for st.metric
+    def _delta(v, good_positive=True):
+        """Return delta string + color direction for st.metric."""
+        if v is None: return None, "off"
+        return f"{v:+.3f}", "normal" if good_positive else "inverse"
+
+    esc_rate = cs["escalation_rate"]
+    res_rate = cs["resolution_rate"]
+
+    cols = st.columns(9)
+
+    with cols[0]:
+        st.metric("Conversations",    f"{ins['total_conversations']:,}")
+    with cols[1]:
+        st.metric("Total Turns",      f"{total_t:,}")
+    with cols[2]:
+        st.metric("Processing Time",  pt_str)
+    with cols[3]:
+        st.metric("Speed",            speed_str)
+    with cols[4]:
+        d, dc = _delta(overall)
+        st.metric("Overall Sent.",    f"{overall:+.3f}", delta=d, delta_color=dc)
+    with cols[5]:
+        d, dc = _delta(cs["average_sentiment"])
+        st.metric("Customer Avg",     f"{cs['average_sentiment']:+.3f}", delta=d, delta_color=dc)
+    with cols[6]:
+        d, dc = _delta(ap["average_sentiment"])
+        st.metric("Agent Avg",        f"{ap['average_sentiment']:+.3f}", delta=d, delta_color=dc)
+    with cols[7]:
+        st.metric("Escalation",       f"{esc_rate:.1%}",
+                  delta=f"{'High' if esc_rate>0.15 else 'OK'}",
+                  delta_color="inverse" if esc_rate > 0.10 else "off")
+    with cols[8]:
+        st.metric("Resolution",       f"{res_rate:.1%}",
+                  delta=f"{'Good' if res_rate>0.60 else 'Low'}",
+                  delta_color="normal" if res_rate > 0.60 else "inverse")
 
 def _phase_table(ins):
     pcd=ins.get("phase_csat_dsat",{}); cp=ins.get("conversation_patterns",{})
@@ -3863,21 +3898,10 @@ def main():
     fname    = st.session_state.get("fname", "")
     pii_meta = st.session_state.get("pii_meta", {"enabled": False, "mode": "off", "redacted_rows": 0})
 
-    # Pipeline timing
+    # Read pipeline timing from session state (set when Run Analysis was clicked)
     _pipeline_secs = st.session_state.get("_pipeline_secs")
-    if _pipeline_secs is not None:
-        _ps = int(_pipeline_secs)
-        _timing_str = f"{_ps//60}m {_ps%60}s" if _ps >= 60 else f"{_pipeline_secs:.1f}s"
-        _timing_badge = (
-            f' &nbsp;·&nbsp; <span style="background:rgba(45,95,110,0.08);'
-            f'border:1px solid {C["border"]};border-radius:4px;padding:1px 7px;'
-            f'font-size:11px;color:{C["muted"]};font-weight:500">'
-            f'⏱️ Analysed in {_timing_str}</span>'
-        )
-    else:
-        _timing_badge = ""
 
-    # Status bar
+    # Status bar — file info + PII badge only (timing is in the KPI row now)
     ca, cb_col, cc = st.columns([3, 2, 1])
     with ca:
         pii_badge = ""
@@ -3885,16 +3909,16 @@ def main():
             n_r  = pii_meta.get("redacted_rows", 0)
             mode = pii_meta.get("mode", "mask")
             pii_badge = (
-                f' &nbsp;·&nbsp; <span style="background:rgba(45,95,110,0.12);'
-                f'border:1px solid {C["teal"]};border-radius:4px;padding:1px 7px;'
-                f'font-size:11px;color:{C["teal"]};font-weight:600">'
+                f' &nbsp;·&nbsp; <span style="background:rgba(45,95,110,0.12);' 
+                f'border:1px solid {C["teal"]};border-radius:4px;padding:1px 7px;' 
+                f'font-size:11px;color:{C["teal"]};font-weight:600">' 
                 f'🛡️ PII {mode} · {n_r:,} rows redacted</span>'
             )
         st.markdown(
-            f'<div style="color:{C["muted"]};font-size:.82rem">'
-            f'📂 {fname} &nbsp;·&nbsp; '
-            f'Format: <strong style="color:{C["teal"]}">{detected}</strong>'
-            f'{pii_badge}{_timing_badge}</div>',
+            f'<div style="color:{C["muted"]};font-size:.82rem">' 
+            f'📂 {fname} &nbsp;·&nbsp; ' 
+            f'Format: <strong style="color:{C["teal"]}">{detected}</strong>' 
+            f'{pii_badge}</div>',
             unsafe_allow_html=True,
         )
     with cc:
@@ -3907,7 +3931,7 @@ def main():
         )
 
     st.markdown("---")
-    _kpi_row(ins, df_r=df_r)
+    _kpi_row(ins, df_r=df_r, pipeline_secs=_pipeline_secs)
     st.markdown("---")
 
     if   page == "📊 Overview":           page_overview(df_r, ins)
