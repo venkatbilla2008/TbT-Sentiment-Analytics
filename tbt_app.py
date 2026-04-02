@@ -2521,76 +2521,110 @@ def render_sidebar():
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE RENDERERS
 # ─────────────────────────────────────────────────────────────────────────────
+def _parse_ts_series(series: pd.Series) -> pd.Series:
+    """
+    Parse a raw timestamp Series into pd.Timestamp (UTC), per-element.
+    Handles ISO dates, HH:MM:SS offsets, and MM:SS offsets.
+    Invalid entries become NaT.
+    """
+    def _parse_one(v):
+        v = str(v).strip()
+        if not v or v in ("nan", "None", ""):
+            return pd.NaT
+        # ISO / datetime string
+        try:
+            return pd.to_datetime(v, utc=True)
+        except Exception:
+            pass
+        # HH:MM:SS  →  treat as seconds offset (call-centre format)
+        try:
+            parts = v.split(":")
+            if len(parts) == 3:
+                s = int(parts[0])*3600 + int(parts[1])*60 + float(parts[2])
+                return pd.Timestamp(s, unit="s", tz="UTC")
+        except Exception:
+            pass
+        # MM:SS
+        try:
+            parts = v.split(":")
+            if len(parts) == 2:
+                s = int(parts[0])*60 + float(parts[1])
+                return pd.Timestamp(s, unit="s", tz="UTC")
+        except Exception:
+            pass
+        return pd.NaT
+
+    return series.map(_parse_one)
+
+
+def _fmt_seconds(total_s: float) -> str:
+    """Format a duration in seconds as a human-readable string."""
+    s = int(total_s)
+    if s <= 0:
+        return "—"
+    days  = s // 86400
+    hours = (s % 86400) // 3600
+    mins  = (s % 3600) // 60
+    secs  = s % 60
+    if days > 0:   return f"{days}d {hours}h {mins}m"
+    if hours > 0:  return f"{hours}h {mins}m"
+    if mins > 0:   return f"{mins}m {secs}s"
+    return f"{secs}s"
+
+
 def _compute_duration_str(df_r: pd.DataFrame) -> str:
     """
-    Compute total conversation time span from the timestamp column.
+    Compute avg call duration per conversation from the timestamp column.
 
-    Returns a human-readable string like "3h 24m" or "47m 12s".
-    Works with all 4 transcript formats — timestamps may be ISO strings,
-    HH:MM:SS strings, or MM:SS strings. Falls back to "—" gracefully.
+    Correct approach
+    ----------------
+    For each conversation:  duration = last_turn_timestamp - first_turn_timestamp
+    Then return:  avg duration across all conversations  (shown as KPI)
+    Also returns total call time as a tooltip-style suffix.
+
+    Why the old approach was wrong
+    ------------------------------
+    The old code did  max(ALL timestamps) - min(ALL timestamps)  which gives
+    the *date range of the whole dataset* (e.g. June 30 → July 1 = 23h 54m),
+    not the duration of any individual call.
     """
     ts_col = "timestamp"
-    if ts_col not in df_r.columns:
+    cid_col = "conversation_id"
+
+    if ts_col not in df_r.columns or cid_col not in df_r.columns:
         return "—"
 
-    raw = df_r[ts_col].dropna().astype(str)
-    raw = raw[raw.str.strip().str.len() > 3]
+    raw = df_r[[cid_col, ts_col]].copy()
+    raw = raw[raw[ts_col].notna()]
+    raw = raw[raw[ts_col].astype(str).str.strip().str.len() > 3]
     if raw.empty:
         return "—"
 
-    parsed: List[pd.Timestamp] = []
-
-    for val in raw:
-        v = val.strip()
-        if not v or v in ("nan", "None", ""):
-            continue
-        try:
-            # Try pandas auto-parse first (handles ISO timestamps)
-            parsed.append(pd.to_datetime(v, infer_datetime_format=True, utc=True))
-            continue
-        except Exception:
-            pass
-        try:
-            # HH:MM:SS — treat as offset seconds from epoch
-            parts = v.split(":")
-            if len(parts) == 3:
-                secs = int(parts[0])*3600 + int(parts[1])*60 + float(parts[2])
-                parsed.append(pd.Timestamp(secs, unit="s", tz="UTC"))
-                continue
-        except Exception:
-            pass
-        try:
-            # MM:SS
-            parts = v.split(":")
-            if len(parts) == 2:
-                secs = int(parts[0])*60 + float(parts[1])
-                parsed.append(pd.Timestamp(secs, unit="s", tz="UTC"))
-        except Exception:
-            pass
-
-    if len(parsed) < 2:
+    raw["_ts"] = _parse_ts_series(raw[ts_col].astype(str))
+    raw = raw.dropna(subset=["_ts"])
+    if raw.empty:
         return "—"
 
-    earliest = min(parsed)
-    latest   = max(parsed)
-    delta    = latest - earliest
-    total_s  = int(delta.total_seconds())
+    # Per-conversation: first and last timestamp → duration in seconds
+    per_conv = (
+        raw.groupby(cid_col)["_ts"]
+           .agg(["min", "max"])
+    )
+    per_conv["dur_s"] = (per_conv["max"] - per_conv["min"]).dt.total_seconds()
 
-    if total_s <= 0:
+    # Only count conversations where we have at least 2 timestamps (dur > 0)
+    valid = per_conv[per_conv["dur_s"] > 0]["dur_s"]
+    if valid.empty:
         return "—"
 
-    days  = total_s // 86400
-    hours = (total_s % 86400) // 3600
-    mins  = (total_s % 3600) // 60
-    secs  = total_s % 60
+    avg_s   = valid.mean()
+    total_s = valid.sum()
 
-    if days > 0:
-        return f"{days}d {hours}h {mins}m"
-    if hours > 0:
-        return f"{hours}h {mins}m"
-    if mins > 0:
-        return f"{mins}m {secs}s"
-    return f"{secs}s"
+    avg_str   = _fmt_seconds(avg_s)
+    total_str = _fmt_seconds(total_s)
+
+    # Show avg prominently; total in parentheses
+    return f"~{avg_str} avg  ({total_str} total)"
 
 
 def _kpi_row(ins, df_r: pd.DataFrame = None):
@@ -2606,7 +2640,7 @@ def _kpi_row(ins, df_r: pd.DataFrame = None):
     data=[
         ("Conversations",  f"{ins['total_conversations']:,}",         "var(--teal)"),
         ("Total Turns",    f"{ins['total_turns']:,}",                  "var(--slate)"),
-        ("Conv Duration",  dur_str,                                    C["slate"]),
+        ("Duration",       dur_str,                                    C["slate"]),
         ("Overall Sent.",  f"{overall:+.3f}",                          _score_color(overall)),
         ("Customer Avg",   f"{cs['average_sentiment']:+.3f}",          _score_color(cs["average_sentiment"])),
         ("Agent Avg",      f"{ap['average_sentiment']:+.3f}",          _score_color(ap["average_sentiment"])),
