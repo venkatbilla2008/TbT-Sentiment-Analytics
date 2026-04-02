@@ -2628,65 +2628,41 @@ def _compute_duration_str(df_r: pd.DataFrame) -> str:
 
 
 def _kpi_row(ins, df_r: pd.DataFrame = None, pipeline_secs: float = None):
-    """
-    KPI strip — uses st.metric() cards (same pattern as reference NLP app).
-
-    Cards:
-      Conversations · Total Turns · Processing Time · Speed ·
-      Overall Sent. · Customer Avg · Agent Avg · Escalation · Resolution · Trend
-    """
     cs      = ins["customer_satisfaction"]
     ap      = ins["agent_performance"]
     cp      = ins["conversation_patterns"]
     overall = ins["overall_sentiment"]["average"]
     total_t = ins["total_turns"]
 
-    # Processing Time + Speed  (from pipeline wall-clock, same as reference app)
+    # Processing Time (wall-clock pipeline time)
     if pipeline_secs and pipeline_secs > 0:
-        ps = int(pipeline_secs)
-        pt_str    = f"{ps//60}m {ps%60}s" if ps >= 60 else f"{pipeline_secs:.1f}s"
-        speed_str = f"{total_t / pipeline_secs:.1f} turns/s"
+        ps     = int(pipeline_secs)
+        pt_str = f"{ps//60}m {ps%60}s" if ps >= 60 else f"{pipeline_secs:.1f}s"
     else:
-        pt_str    = "—"
-        speed_str = "—"
-
-    # Sentiment delta indicators for st.metric
-    def _delta(v, good_positive=True):
-        """Return delta string + color direction for st.metric."""
-        if v is None: return None, "off"
-        return f"{v:+.3f}", "normal" if good_positive else "inverse"
+        pt_str = "—"
 
     esc_rate = cs["escalation_rate"]
     res_rate = cs["resolution_rate"]
+    esc_c  = C["neg"]  if esc_rate > 0.15 else C["warn"] if esc_rate > 0.10 else C["ok"]
+    res_c  = C["ok"]   if res_rate > 0.60  else C["warn"] if res_rate > 0.40  else C["neg"]
 
-    cols = st.columns(9)
-
-    with cols[0]:
-        st.metric("Conversations",    f"{ins['total_conversations']:,}")
-    with cols[1]:
-        st.metric("Total Turns",      f"{total_t:,}")
-    with cols[2]:
-        st.metric("Processing Time",  pt_str)
-    with cols[3]:
-        st.metric("Speed",            speed_str)
-    with cols[4]:
-        d, dc = _delta(overall)
-        st.metric("Overall Sent.",    f"{overall:+.3f}", delta=d, delta_color=dc)
-    with cols[5]:
-        d, dc = _delta(cs["average_sentiment"])
-        st.metric("Customer Avg",     f"{cs['average_sentiment']:+.3f}", delta=d, delta_color=dc)
-    with cols[6]:
-        d, dc = _delta(ap["average_sentiment"])
-        st.metric("Agent Avg",        f"{ap['average_sentiment']:+.3f}", delta=d, delta_color=dc)
-    with cols[7]:
-        st.metric("Escalation",       f"{esc_rate:.1%}",
-                  delta=f"{'High' if esc_rate>0.15 else 'OK'}",
-                  delta_color="inverse" if esc_rate > 0.10 else "off")
-    with cols[8]:
-        st.metric("Resolution",       f"{res_rate:.1%}",
-                  delta=f"{'Good' if res_rate>0.60 else 'Low'}",
-                  delta_color="normal" if res_rate > 0.60 else "inverse")
-
+    cols = st.columns(8)
+    data = [
+        ("Conversations",   f"{ins['total_conversations']:,}",           "var(--teal)"),
+        ("Total Turns",     f"{total_t:,}",                               "var(--slate)"),
+        ("Processing Time", pt_str,                                        C["slate"]),
+        ("Overall Sent.",   f"{overall:+.3f}",                            _score_color(overall)),
+        ("Customer Avg",    f"{cs['average_sentiment']:+.3f}",            _score_color(cs["average_sentiment"])),
+        ("Agent Avg",       f"{ap['average_sentiment']:+.3f}",            _score_color(ap["average_sentiment"])),
+        ("Escalation",      f"{esc_rate:.1%}",                            esc_c),
+        ("Resolution",      f"{res_rate:.1%}",                            res_c),
+    ]
+    for col, (lbl, val, color) in zip(cols, data):
+        with col:
+            st.markdown(
+                mc(lbl, f'<span style="color:{color}">{val}</span>', color),
+                unsafe_allow_html=True,
+            )
 def _phase_table(ins):
     pcd=ins.get("phase_csat_dsat",{}); cp=ins.get("conversation_patterns",{})
     rows=""
