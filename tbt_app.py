@@ -805,42 +805,21 @@ class AnalyticsEngine:
             (pl.col("compound") <  0).alias("is_dsat"),
         ])
 
-        # ── Pure Polars window functions — replaces all per-group Python loops ──
-        # sentiment_change  = first-difference of compound per conversation
-        # sentiment_momentum = 3-point causal rolling mean of the change
-        # Both use Polars .diff() and .rolling_mean() with partition_by — Rust speed.
+        # ── Polars window: sentiment change + momentum + speaker tracking ──────
         lf = lf.with_columns([
-            # First difference (shift(1) within each conversation)
             (pl.col("compound") - pl.col("compound").shift(1).over("conversation_id"))
               .fill_null(0.0).alias("sentiment_change"),
         ]).with_columns([
-            # 3-point causal rolling mean of sentiment_change (window=3, min_periods=1)
             pl.col("sentiment_change")
               .rolling_mean(window_size=3, min_periods=1)
               .over("conversation_id")
               .alias("sentiment_momentum"),
-            # Previous speaker within each conversation
             pl.col("speaker").shift(1).over("conversation_id").alias("prev_speaker"),
         ]).with_columns([
-            # Speaker changed flag
             (pl.col("speaker") != pl.col("prev_speaker").fill_null("")).alias("speaker_changed"),
-        ]).with_columns([
-            # Escalation / resolution flags
-            (
-                (pl.col("sentiment_change") < -0.3) &
-                (pl.col("speaker") == "CUSTOMER") &
-                (pl.col("turn_sequence") > 2)
-            ).alias("potential_escalation"),
-            (
-                (pl.col("sentiment_change") > 0.2) &
-                (pl.col("speaker") == "CUSTOMER") &
-                pl.col("is_conversation_end")
-            ).alias("potential_resolution"),
         ])
 
-        # consecutive_turns: run-length within speaker streaks per conversation
-        # Polars does not have a native run-length-encode window, so we compute it
-        # via a cumsum of speaker_changed as a group key, then rank within group.
+        # consecutive_turns run-length
         lf = lf.with_columns([
             pl.col("speaker_changed").cast(pl.Int32)
               .cum_sum().over("conversation_id").alias("_streak_id"),
@@ -849,10 +828,209 @@ class AnalyticsEngine:
               .alias("consecutive_turns"),
         ]).drop("_streak_id")
 
-        # _safe_collect() — version-safe streaming collect (lower RAM).
-        # Falls back to standard collect() if streaming is unsupported for this plan.
         d = _safe_collect(lf).to_pandas()
         d = d.sort_values(["conversation_id","turn_sequence"]).reset_index(drop=True)
+
+        # ── CHANGE 4: Multi-signal escalation detection ───────────────────────
+        # Signal A (25%): sentiment drop > 0.2 from previous customer turn
+        # Signal B (40%): explicit escalation trigger language
+        # Signal C (20%): repetition — same complaint repeated (bigram overlap)
+        # Signal D (15%): frustration build — 3+ consecutive negative customer turns
+        import re as _re
+        ESC_TRIGGERS = [
+            "speak to manager","supervisor","escalate","unacceptable","not good enough",
+            "complained before","file a complaint","this is ridiculous","how many times",
+            "nobody helps","waste of time","cancel everything","worst service",
+            "third time","been waiting","still not resolved","no one helped",
+            "calling back","not working","sick of this","completely useless",
+        ]
+
+        n_rows = len(d)
+        esc_score   = np.zeros(n_rows, dtype=np.float32)
+        sig_types   = [""] * n_rows
+        frust_streak = np.zeros(n_rows, dtype=np.int32)
+
+        # Pre-build bigram sets per message for repetition check
+        def _bigrams(text):
+            words = _re.findall(r"[a-z]{3,}", str(text).lower())
+            return set(f"{words[i]} {words[i+1]}" for i in range(len(words)-1))
+
+        # Group by conversation for signal C + D
+        for cid, grp in d.groupby("conversation_id", sort=False):
+            idxs = grp.index.tolist()
+            cust_idxs = grp[grp["speaker"] == "CUSTOMER"].index.tolist()
+
+            # Signal D: frustration streak (consecutive neg customer turns)
+            neg_streak = 0
+            for i in idxs:
+                if d.loc[i,"speaker"] == "CUSTOMER" and d.loc[i,"compound"] < -0.1:
+                    neg_streak += 1
+                else:
+                    neg_streak = 0
+                frust_streak[i] = neg_streak
+
+            # Signal C: repetition — compare each customer turn bigrams to all prior ones
+            seen_bigrams: set = set()
+            for i in cust_idxs:
+                msg_bg = _bigrams(d.loc[i,"cleaned_message"])
+                overlap = len(msg_bg & seen_bigrams)
+                if overlap >= 2:
+                    d.loc[i, "_repetition"] = True
+                seen_bigrams |= msg_bg
+
+        d["_repetition"] = d.get("_repetition", False).fillna(False) if "_repetition" in d.columns else False
+
+        for i in range(n_rows):
+            row = d.iloc[i]
+            if row["speaker"] != "CUSTOMER":
+                continue
+
+            sig_a = sig_b = sig_c = sig_d = 0.0
+            fired = []
+
+            # A: sentiment drop
+            if row["sentiment_change"] < -0.2 and row["turn_sequence"] > 2:
+                sig_a = min(abs(row["sentiment_change"]) / 0.6, 1.0)
+                fired.append("sentiment_drop")
+
+            # B: language trigger
+            msg_l = str(row.get("cleaned_message","")).lower()
+            for trig in ESC_TRIGGERS:
+                if trig in msg_l:
+                    sig_b = 1.0; fired.append("language"); break
+
+            # C: repetition
+            if d.iloc[i].get("_repetition", False):
+                sig_c = 1.0; fired.append("repetition")
+
+            # D: frustration streak ≥ 3
+            if frust_streak[i] >= 3:
+                sig_d = 1.0; fired.append("frustration_build")
+
+            score = 0.25*sig_a + 0.40*sig_b + 0.20*sig_c + 0.15*sig_d
+            esc_score[i] = score
+            if fired:
+                sig_types[i] = "|".join(fired)
+
+        d["escalation_score"]       = esc_score
+        d["escalation_signal_type"] = sig_types
+        d["frustration_streak"]     = frust_streak
+        d["potential_escalation"]   = esc_score >= 0.40   # threshold
+
+        # ── CHANGE 1: Hybrid resolution detection ────────────────────────────
+        # Per conversation: compute resolution_status (4-way) and resolution_score
+        RESOLVED_PHRASES = [
+            "thank you","that worked","resolved","sorted","all set","appreciate",
+            "great help","got it","perfect","that's all i needed","you've fixed",
+            "problem solved","issue resolved","taken care","wonderful","excellent",
+            "fixed it","glad we sorted","happy with","that helps","thank you so much",
+        ]
+        UNRESOLVED_PHRASES = [
+            "still not","hasn't been","not fixed","same problem","not resolved",
+            "wait again","calling back","not working","still waiting","no one helped",
+            "not happy","this is unacceptable","not satisfied","doesn't work",
+            "still having","keep getting","continues to","nothing changed",
+            "never resolved","same issue","back again","problem persists",
+        ]
+
+        # Per-conversation resolution computation
+        res_status_map: Dict[str, str]  = {}
+        res_score_map:  Dict[str, float] = {}
+
+        for cid, grp in d.groupby("conversation_id", sort=False):
+            cust  = grp[grp["speaker"] == "CUSTOMER"]
+            last3 = cust.tail(3)
+            if last3.empty:
+                res_status_map[cid] = "Unresolved"; res_score_map[cid] = 0.0; continue
+
+            # A: Sentiment signal (30%) — avg compound in last 3 customer turns
+            sent_avg  = float(last3["compound"].mean())
+            sig_sent  = max(0.0, min(1.0, (sent_avg + 0.5)))   # map [-0.5,0.5] → [0,1]
+
+            # B: Resolution language (50%)
+            end_text  = " ".join(last3["cleaned_message"].fillna("").tolist()).lower()
+            pos_hits  = sum(1 for p in RESOLVED_PHRASES   if p in end_text)
+            neg_hits  = sum(1 for p in UNRESOLVED_PHRASES if p in end_text)
+            sig_lang  = max(0.0, min(1.0, (pos_hits*0.3 - neg_hits*0.4 + 0.5)))
+
+            # C: Outcome signal (20%) — no escalation in final 3 turns + no negative drop
+            last3_esc = grp.tail(3)["potential_escalation"].any()
+            final_drop = float(grp.tail(1)["sentiment_change"].values[0]) if len(grp) > 0 else 0
+            sig_out   = 0.0 if last3_esc else (1.0 if final_drop >= -0.1 else 0.5)
+
+            score = 0.30*sig_sent + 0.50*sig_lang + 0.20*sig_out
+
+            # Has explicit unresolved language → cap score
+            if neg_hits > 0 and neg_hits >= pos_hits:
+                score = min(score, 0.29)
+
+            res_score_map[cid] = round(score, 3)
+
+            # 4-way status
+            has_esc_end = grp.tail(3)["potential_escalation"].any()
+            if has_esc_end and score < 0.35:
+                res_status_map[cid] = "Escalated/Unrecovered"
+            elif score >= 0.60:
+                res_status_map[cid] = "Truly Resolved"
+            elif score >= 0.30:
+                res_status_map[cid] = "Partially Resolved"
+            else:
+                res_status_map[cid] = "Unresolved"
+
+        d["resolution_score"]  = d["conversation_id"].map(res_score_map).fillna(0.0)
+        d["resolution_status"] = d["conversation_id"].map(res_status_map).fillna("Unresolved")
+        # Keep backward-compat potential_resolution flag (True = Truly Resolved)
+        d["potential_resolution"] = d["resolution_status"] == "Truly Resolved"
+
+        # ── CHANGE 2: Agent effectiveness (per-conversation) ─────────────────
+        # For each AGENT turn: measure customer compound change in next 3 customer turns
+        # Bucket per conversation: Improver / Stabiliser / Worsener
+        agent_eff_map: Dict[str, str]   = {}
+        agent_delta_map: Dict[str, float] = {}
+
+        for cid, grp in d.groupby("conversation_id", sort=False):
+            grp   = grp.reset_index(drop=True)
+            cust  = grp[grp["speaker"] == "CUSTOMER"].reset_index(drop=True)
+            agent = grp[grp["speaker"] == "AGENT"].reset_index(drop=True)
+            if agent.empty or cust.empty:
+                agent_eff_map[cid]   = "Stabiliser"
+                agent_delta_map[cid] = 0.0
+                continue
+
+            deltas = []
+            for _, ar in agent.iterrows():
+                at = ar["turn_sequence"]
+                # next 3 customer turns after this agent turn
+                next_cust = cust[cust["turn_sequence"] > at].head(3)
+                # baseline: last customer turn before this agent turn
+                prev_cust = cust[cust["turn_sequence"] < at].tail(1)
+                if next_cust.empty or prev_cust.empty:
+                    continue
+                baseline = float(prev_cust["compound"].values[0])
+                after    = float(next_cust["compound"].mean())
+                deltas.append(after - baseline)
+
+            if not deltas:
+                agent_eff_map[cid]   = "Stabiliser"
+                agent_delta_map[cid] = 0.0
+                continue
+
+            avg_delta = float(np.mean(deltas))
+            agent_delta_map[cid] = round(avg_delta, 3)
+            if avg_delta > 0.10:
+                agent_eff_map[cid] = "Improver"
+            elif avg_delta < -0.05:
+                agent_eff_map[cid] = "Worsener"
+            else:
+                agent_eff_map[cid] = "Stabiliser"
+
+        d["agent_effectiveness"]       = d["conversation_id"].map(agent_eff_map).fillna("Stabiliser")
+        d["agent_customer_delta"]      = d["conversation_id"].map(agent_delta_map).fillna(0.0)
+
+        # Drop temp column
+        if "_repetition" in d.columns:
+            d = d.drop(columns=["_repetition"])
+
         gc.collect()
         return d
 
@@ -896,20 +1074,47 @@ class AnalyticsEngine:
               .select((pl.col("sentiment_label") == "positive").mean())
               .collect().item() or 0.0
         )
+
+        # ── Resolution rate from hybrid 4-way status ──────────────────────────
+        n_convs = int(df["conversation_id"].nunique())
+        res_counts = df.drop_duplicates("conversation_id")["resolution_status"].value_counts()                      if "resolution_status" in df.columns else pd.Series(dtype=int)
+        truly_resolved   = int(res_counts.get("Truly Resolved",       0))
+        partially_res    = int(res_counts.get("Partially Resolved",    0))
+        unresolved_n     = int(res_counts.get("Unresolved",            0))
+        esc_unrecovered  = int(res_counts.get("Escalated/Unrecovered", 0))
+        # resolution_rate = Truly Resolved / total (strict) for KPI card
+        hybrid_res_rate  = truly_resolved / max(n_convs, 1)
+
         ins["customer_satisfaction"] = {
-            "average_sentiment": cu.get("compound", 0.0),
-            "positive_pct":      pos_pct,
-            "escalation_rate":   cu.get("potential_escalation", 0.0),
-            "resolution_rate":   cu.get("potential_resolution", 0.0),
+            "average_sentiment":      cu.get("compound", 0.0),
+            "positive_pct":           pos_pct,
+            "escalation_rate":        cu.get("potential_escalation", 0.0),
+            "resolution_rate":        hybrid_res_rate,
+            # 4-way breakdown (used by new charts/tables)
+            "truly_resolved":         truly_resolved,
+            "partially_resolved":     partially_res,
+            "unresolved":             unresolved_n,
+            "escalated_unrecovered":  esc_unrecovered,
         }
+
+        # ── Agent effectiveness from per-conversation buckets ─────────────────
         ag_std = float(
             lf.filter(pl.col("speaker") == "AGENT")
               .select(pl.col("compound").std()).collect().item() or 0.0
         )
+        eff_counts = df.drop_duplicates("conversation_id")["agent_effectiveness"].value_counts()                      if "agent_effectiveness" in df.columns else pd.Series(dtype=int)
+        n_c_eff = max(n_convs, 1)
+        avg_delta = float(df.drop_duplicates("conversation_id")["agent_customer_delta"].mean())                     if "agent_customer_delta" in df.columns else 0.0
+
         ins["agent_performance"] = {
             "average_sentiment":      ag.get("compound", 0.0),
             "response_effectiveness": ag.get("sentiment_change", 0.0),
             "consistency_score":      max(0.0, 1.0 - ag_std),
+            # New effectiveness distribution
+            "improver_pct":           int(eff_counts.get("Improver",   0)) / n_c_eff,
+            "stabiliser_pct":         int(eff_counts.get("Stabiliser", 0)) / n_c_eff,
+            "worsener_pct":           int(eff_counts.get("Worsener",   0)) / n_c_eff,
+            "avg_customer_delta":     round(avg_delta, 3),
         }
 
         phase_avgs = (
@@ -958,7 +1163,13 @@ class AnalyticsEngine:
         if cs["average_sentiment"]       < 0:    r.append("🔴 Customer sentiment below neutral — review agent training & scripts.")
         if cs["escalation_rate"]         > 0.15: r.append(f"⚠️ High escalation rate ({cs['escalation_rate']:.1%}) — train de-escalation techniques.")
         elif cs["escalation_rate"]       > 0.10: r.append(f"⚠️ Moderate escalation rate ({cs['escalation_rate']:.1%}) — monitor closely.")
-        if cs["resolution_rate"]         < 0.5:  r.append(f"🔴 Low resolution rate ({cs['resolution_rate']:.1%}) — improve closing strategies.")
+        # Resolution: use hybrid rate
+        if cs["resolution_rate"]         < 0.4:  r.append(f"🔴 True resolution rate only {cs['resolution_rate']:.1%} — review closing language & outcome verification.")
+        esc_unr = cs.get("escalated_unrecovered", 0)
+        if esc_unr > 0: r.append(f"🔴 {esc_unr} conversations escalated and never recovered — priority coaching needed.")
+        # Agent effectiveness
+        if ap.get("worsener_pct", 0) > 0.20: r.append(f"⚠️ {ap['worsener_pct']:.0%} of agents worsen customer sentiment — review response scripts.")
+        if ap.get("improver_pct", 0) > 0.50: r.append(f"✅ {ap['improver_pct']:.0%} of agents improve customer sentiment — document best practices.")
         if ap["average_sentiment"]       < 0.1:  r.append("📚 Agent sentiment low — tone coaching recommended.")
         if cp["sentiment_improvement"]   < 0:    r.append("📉 Conversations end worse than they start — review resolution processes.")
         elif cp["sentiment_improvement"] > 0.2:  r.append("📈 Strong positive improvement — document & replicate best-practice behaviours.")
@@ -1346,24 +1557,45 @@ def _precompute_aggs(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         .rename(columns={"start": "source", "end": "target"})
     )
 
-    # 2. Turn-by-turn consecutive sentiment transitions (all turns, all speakers)
-    #    e.g. positive→neutral, neutral→negative, etc.
-    df_sorted = pl.from_pandas(
-        df.sort_values(["conversation_id", "turn_sequence"])
-    ).lazy()
-    turn_flow = (
-        df_sorted
-        .with_columns(
-            pl.col("sentiment_label").shift(1).over("conversation_id").alias("prev_label")
-        )
-        .filter(pl.col("prev_label").is_not_null())
-        .group_by(["prev_label", "sentiment_label", "speaker"])
-        .agg(pl.len().alias("count"))
-        .collect().to_pandas()
-        .rename(columns={"prev_label": "source", "sentiment_label": "target"})
-    )
+    # 2. Outcome Flow Sankey: Start Sentiment → Resolution Status → End Sentiment
+    #    Uses hybrid resolution_status column from compute_turn_metrics
+    if "resolution_status" in df.columns:
+        conv_summary = df.drop_duplicates("conversation_id").copy()
 
-    # 3. Speaker-sentiment Sankey: Speaker → Phase → Sentiment
+        # Start sentiment: dominant customer sentiment in start phase
+        start_sent_df = (
+            cust_df.filter(pl.col("phase") == "start")
+              .group_by(["conversation_id","sentiment_label"])
+              .agg(pl.len().alias("n"))
+              .sort(["conversation_id","n"], descending=[False,True])
+              .group_by("conversation_id")
+              .agg(pl.col("sentiment_label").first().alias("start_sent"))
+              .collect().to_pandas()
+        )
+        # End sentiment: dominant customer sentiment in end phase
+        end_sent_df = (
+            cust_df.filter(pl.col("phase") == "end")
+              .group_by(["conversation_id","sentiment_label"])
+              .agg(pl.len().alias("n"))
+              .sort(["conversation_id","n"], descending=[False,True])
+              .group_by("conversation_id")
+              .agg(pl.col("sentiment_label").first().alias("end_sent"))
+              .collect().to_pandas()
+        )
+
+        outcome_flow_df = (
+            conv_summary[["conversation_id","resolution_status"]]
+            .merge(start_sent_df, on="conversation_id", how="left")
+            .merge(end_sent_df,   on="conversation_id", how="left")
+            .fillna({"start_sent": "neutral", "end_sent": "neutral",
+                     "resolution_status": "Unresolved"})
+        )
+    else:
+        outcome_flow_df = pd.DataFrame(
+            columns=["conversation_id","resolution_status","start_sent","end_sent"]
+        )
+
+    # Speaker-sentiment Sankey: Speaker → Phase → Sentiment (kept for internal use)
     spk_phase_sent = (
         lf.group_by(["speaker", "phase", "sentiment_label"])
           .agg(pl.len().alias("count"))
@@ -1371,19 +1603,20 @@ def _precompute_aggs(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     )
 
     return {
-        "sent_dist":      sent_dist,
-        "conv_map":       conv_map,
-        "phase_speaker":  phase_speaker,
-        "turn_prog":      turn_prog,
-        "esc_res":        esc_res,
-        "sample":         sample,
-        # Sankey data
-        "sm_flow":        sm_flow,
-        "me_flow":        me_flow,
-        "se_flow":        se_flow,
-        "turn_flow":      turn_flow,
-        "phase_pivot":    phase_pivot,
-        "spk_phase_sent": spk_phase_sent,
+        "sent_dist":       sent_dist,
+        "conv_map":        conv_map,
+        "phase_speaker":   phase_speaker,
+        "turn_prog":       turn_prog,
+        "esc_res":         esc_res,
+        "sample":          sample,
+        # Phase Sankey data (retained)
+        "sm_flow":         sm_flow,
+        "me_flow":         me_flow,
+        "se_flow":         se_flow,
+        "phase_pivot":     phase_pivot,
+        "spk_phase_sent":  spk_phase_sent,
+        # Outcome Flow Sankey (new)
+        "outcome_flow_df": outcome_flow_df,
     }
 
 
@@ -1709,6 +1942,118 @@ def _chart_sankey_start_to_end(aggs: dict) -> go.Figure:
 
     return _build_sankey(all_labels, srcs, tgts, vals, node_colors, link_colors,
                          title="🎯 Start → End Sentiment  (how conversations open vs. close — skips middle)")
+
+@st.cache_data(show_spinner=False)
+def _chart_sankey_outcome_flow(aggs: dict) -> go.Figure:
+    """
+    Sankey 3 — Outcome Flow: Start Sentiment → Resolution Status → End Sentiment
+    ---------------------------------------------------------------------------
+    Shows the real business outcome journey for each conversation.
+    Resolution Status uses the hybrid 4-way classification:
+      Truly Resolved / Partially Resolved / Unresolved / Escalated+Unrecovered
+    """
+    df = aggs.get("outcome_flow_df", pd.DataFrame())
+    if df.empty or "resolution_status" not in df.columns:
+        fig = go.Figure()
+        fig.add_annotation(text="No resolution status data — re-run analysis",
+                           xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+        return fig
+
+    SENTIMS = ["positive", "neutral", "negative"]
+    STATUSES = ["Truly Resolved", "Partially Resolved", "Unresolved", "Escalated/Unrecovered"]
+
+    # Node layout: [Start Sentiment] → [Resolution Status] → [End Sentiment]
+    labels, idx = [], {}
+    for s in SENTIMS:
+        idx[("start", s)] = len(labels)
+        labels.append(f"Start {s.capitalize()}")
+    for st in STATUSES:
+        idx[("res", st)] = len(labels)
+        labels.append(st)
+    for s in SENTIMS:
+        idx[("end", s)] = len(labels)
+        labels.append(f"End {s.capitalize()}")
+
+    STATUS_COLORS = {
+        "Truly Resolved":         C["pos"],
+        "Partially Resolved":     C["gold"],
+        "Unresolved":             C["warn"],
+        "Escalated/Unrecovered":  C["neg"],
+    }
+    SENT_COLORS = {
+        "positive": C["pos"],
+        "neutral":  C["neu"],
+        "negative": C["neg"],
+    }
+    node_colors = (
+        [SENT_COLORS.get(s, C["slate"]) for s in SENTIMS] +
+        [STATUS_COLORS.get(st, C["slate"]) for st in STATUSES] +
+        [SENT_COLORS.get(s, C["slate"]) for s in SENTIMS]
+    )
+
+    srcs, tgts, vals, link_colors = [], [], [], []
+
+    # Layer 1: Start → Resolution Status
+    for (start_s, res_s), grp in df.groupby(["start_sent", "resolution_status"]):
+        start_s = str(start_s).lower()
+        if start_s not in SENTIMS or res_s not in STATUSES: continue
+        v = len(grp)
+        if v <= 0: continue
+        srcs.append(idx[("start", start_s)])
+        tgts.append(idx[("res",   res_s)])
+        vals.append(v)
+        hx = SENT_COLORS.get(start_s, C["slate"])
+        r,g,b = int(hx[1:3],16), int(hx[3:5],16), int(hx[5:7],16)
+        link_colors.append(f"rgba({r},{g},{b},0.30)")
+
+    # Layer 2: Resolution Status → End Sentiment
+    for (res_s, end_s), grp in df.groupby(["resolution_status", "end_sent"]):
+        end_s = str(end_s).lower()
+        if res_s not in STATUSES or end_s not in SENTIMS: continue
+        v = len(grp)
+        if v <= 0: continue
+        srcs.append(idx[("res", res_s)])
+        tgts.append(idx[("end", end_s)])
+        vals.append(v)
+        hx = STATUS_COLORS.get(res_s, C["slate"])
+        r,g,b = int(hx[1:3],16), int(hx[3:5],16), int(hx[5:7],16)
+        link_colors.append(f"rgba({r},{g},{b},0.28)")
+
+    if not vals:
+        fig = go.Figure()
+        fig.add_annotation(text="Insufficient data for Outcome Flow chart",
+                           xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+        return fig
+
+    fig = go.Figure(go.Sankey(
+        arrangement="snap",
+        node=dict(
+            pad=18, thickness=22,
+            line=dict(color=C["border"], width=0.5),
+            label=labels,
+            color=node_colors,
+            hovertemplate="<b>%{label}</b><br>Conversations: %{value:,}<extra></extra>",
+        ),
+        link=dict(
+            source=srcs, target=tgts, value=vals, color=link_colors,
+            hovertemplate=(
+                "<b>%{source.label}</b> → <b>%{target.label}</b><br>"
+                "Conversations: <b>%{value:,}</b><extra></extra>"
+            ),
+        ),
+    ))
+    fig.update_layout(
+        title=dict(
+            text="🎯 Outcome Flow: Start Sentiment → Resolution Status → End Sentiment",
+            font=dict(size=14, color=C["text"]), x=0,
+        ),
+        height=560,
+        margin=dict(l=10, r=10, t=55, b=10),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="DM Sans", color=C["text"], size=12),
+    )
+    return fig
+
 
 def _chart_escalation_resolution(aggs):
     er=aggs["esc_res"]; tot=er["convs"].iloc[0]
@@ -2767,11 +3112,8 @@ def page_sankey(df_r, ins):
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ── Tab layout — 2 Sankey tabs ─────────────────────────────────────────────
-    tab1, tab2 = st.tabs([
-        "🌊 Phase Flow",
-        "🔀 Turn Transitions",
-    ])
+    # ── 2 Sankey tabs: Phase Flow (retained) + Outcome Flow (new) ───────────
+    tab1, tab2 = st.tabs(["🌊 Phase Flow", "🎯 Outcome Flow"])
 
     with tab1:
         st.markdown(
@@ -2787,53 +3129,33 @@ def page_sankey(df_r, ins):
     with tab2:
         st.markdown(
             f'<div style="background:{C["warm_l"]};border-left:3px solid {C["teal"]};'
-            f'border-radius:6px;padding:8px 14px;font-size:12px;color:{C["text2"]};margin-bottom:10px">'
-            f'📖 <strong>How to read:</strong> Left = sentiment of the current turn. '
-            f'Right = sentiment of the very next turn in the same conversation. '
-            f'Band width = number of turn-level transitions. '
-            f'A thick band from Positive(from) → Negative(to) means sentiment drops sharply between turns.</div>',
+            f'border-radius:6px;padding:8px 14px;font-size:12px;color:{C["text2"]};margin-bottom:12px">'
+            f'📖 <strong>How to read:</strong> '
+            f'<strong>Left</strong> = how the conversation started (customer sentiment). '
+            f'<strong>Middle</strong> = true business outcome (hybrid: sentiment + language + outcome logic). '
+            f'<strong>Right</strong> = how it ended. '
+            f'Key paths: 🔴 Positive Start → Unresolved → Negative End = deterioration. '
+            f'✅ Negative Start → Truly Resolved → Positive End = recovery success.</div>',
             unsafe_allow_html=True,
         )
-        spk_col, _ = st.columns([1, 3])
-        with spk_col:
-            spk_filter = st.selectbox("Filter by speaker", ["ALL","CUSTOMER","AGENT"], key="sankey_spk")
-        st.plotly_chart(_chart_sankey_turn_transitions(aggs, spk_filter), width="stretch")
+        st.plotly_chart(_chart_sankey_outcome_flow(aggs), width="stretch")
 
-        # Transition matrix table
-        tf = aggs["turn_flow"].copy()
-        if spk_filter != "ALL":
-            tf = tf[tf["speaker"] == spk_filter]
-        tf = tf.groupby(["source","target"], as_index=False)["count"].sum()
-        tf = tf.sort_values("count", ascending=False)
-        if not tf.empty:
-            st.markdown(
-                f'<div class="sh" style="margin-top:16px">📋 Transition Matrix '
-                f'<span style="font-size:11px;color:{C["muted"]};font-weight:400"> — sorted by volume</span></div>',
-                unsafe_allow_html=True,
-            )
-            tf["movement"] = tf["source"].str.capitalize() + " → " + tf["target"].str.capitalize()
-            tf["pct"] = (tf["count"] / tf["count"].sum() * 100).round(1).astype(str) + "%"
-            def _mv_badge(row):
-                s, t = row["source"].lower(), row["target"].lower()
-                if s == t:                              return f'<span class="badge b-info">↔ Stable</span>'
-                if s == "negative" and t == "positive": return f'<span class="badge b-ok">↑ Recovery</span>'
-                if s == "positive" and t == "negative": return f'<span class="badge b-err">↓ Decline</span>'
-                if t == "neutral":                      return f'<span class="badge b-warn">→ Neutral</span>'
-                return f'<span class="badge b-info">→ Shift</span>'
-            tf["type"] = tf.apply(_mv_badge, axis=1)
-            rows_html = "".join(
-                f"<tr><td>{r['movement']}</td>"
-                f"<td style='text-align:right;font-family:monospace'>{int(r['count']):,}</td>"
-                f"<td style='text-align:right'>{r['pct']}</td>"
-                f"<td>{r['type']}</td></tr>"
-                for _, r in tf.iterrows()
-            )
-            st.markdown(
-                f"<table class='pt'><thead><tr>"
-                f"<th>Transition</th><th>Count</th><th>Share</th><th>Type</th>"
-                f"</tr></thead><tbody>{rows_html}</tbody></table>",
-                unsafe_allow_html=True,
-            )
+        # Resolution status summary cards
+        res_data = [
+            ("✅ Truly Resolved",        aggs["outcome_flow_df"]["resolution_status"].eq("Truly Resolved").sum()       if not aggs["outcome_flow_df"].empty else 0, C["pos"]),
+            ("🔶 Partially Resolved",    aggs["outcome_flow_df"]["resolution_status"].eq("Partially Resolved").sum()   if not aggs["outcome_flow_df"].empty else 0, C["gold"]),
+            ("⛔ Unresolved",            aggs["outcome_flow_df"]["resolution_status"].eq("Unresolved").sum()           if not aggs["outcome_flow_df"].empty else 0, C["warn"]),
+            ("🔴 Escalated/Unrecovered", aggs["outcome_flow_df"]["resolution_status"].eq("Escalated/Unrecovered").sum() if not aggs["outcome_flow_df"].empty else 0, C["neg"]),
+        ]
+        total_r = sum(v for _,v,_ in res_data) or 1
+        st.markdown("<br>", unsafe_allow_html=True)
+        rc1, rc2, rc3, rc4 = st.columns(4)
+        for col, (lbl, cnt, color) in zip([rc1,rc2,rc3,rc4], res_data):
+            with col:
+                st.markdown(
+                    mc(lbl, f'<span style="color:{color}">{int(cnt):,} ({cnt/total_r:.0%})</span>', color),
+                    unsafe_allow_html=True,
+                )
 
 # ─── Overview ─────────────────────────────────────────────────────────────────
 def page_overview(df_r, ins):
